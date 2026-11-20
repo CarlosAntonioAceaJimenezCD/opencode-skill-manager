@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""skillctl — gestor automático de skills para OpenCode.
+
+Subcomandos:
+  refresh                    Actualiza el índice del catálogo (llms-full.txt)
+  search "<texto>"           Busca candidatas y las puntúa
+  session-begin [slug...]    Inicia la sesión y fija skills para toda la sesión
+  session-keep <slug...>     Suma skills al set fijo de esta sesión
+  session-drop <slug...>     Quita skills del set fijo de esta sesión
+  session-end                Cierra la sesión y limpia el set fijo
+  begin "<tarea>"            Inicia una tarea (conserva las fijas de sesión)
+  ensure <slug...>           Instala/reactiva y marca activa (sin límite)
+  sync                       Desactiva lo que no sea core, fijo, activo o pinned
+  sync --dry-run             Muestra qué desactivaría, sin mover nada
+  status                     Muestra sesión, tarea, fijas y conteos
+  list                       Lista activas y desactivadas
+  enable <slug>              Reactiva una skill desactivada
+  disable <slug>             Desactiva una skill (y la desfija)
+  pin <slug>                 La fija para todas las sesiones
+  unpin <slug>               Quita la fijación global
+  restore                    Reactiva todas las desactivadas
+  end                        Cierra la tarea actual (conserva las fijas)
+
+Entorno:
+  OPENCODE_SKILLS_DIR            Raíz de skills a gestionar (default: dos niveles arriba del script)
+  OPENCODE_SKILLS_DISABLED       Carpeta de desactivadas (default: ../skills-disabled)
+  OPENCODE_SKILL_MANAGER_STATE   Archivo de estado (default: ../skill-manager/state.json)
+  OPENCODE_SKILL_CATALOG_DIR     Caché del catálogo (default: ../skill-catalog)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+def env_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name, "").strip()
+    return Path(raw).expanduser().resolve() if raw else default
+
+
+# El script vive en <raíz-de-skills>/skill-manager/scripts/skillctl.
+# parents[2] funciona igual en ~/.config/opencode/skills y en .opencode/skills.
+SKILLS = env_path("OPENCODE_SKILLS_DIR", Path(__file__).resolve().parents[2])
+DISABLED = env_path("OPENCODE_SKILLS_DISABLED", SKILLS.parent / "skills-disabled")
+CATALOG_DIR = env_path("OPENCODE_SKILL_CATALOG_DIR", SKILLS.parent / "skill-catalog")
+INDEX = CATALOG_DIR / "index.tsv"
+STAMP = CATALOG_DIR / ".stamp"
+STATE = env_path(
+    "OPENCODE_SKILL_MANAGER_STATE", SKILLS.parent / "skill-manager" / "state.json"
+)
+SOURCE = "https://opencodeskills.dev/llms-full.txt"
+ALLOWED_HOST = "opencodeskills.dev"
+MAX_AGE = 7 * 86400
+DEFAULT_CORE = ["skill-manager"]
+STOPWORDS = {
+    "de", "la", "el", "los", "las", "un", "una", "y", "o", "en", "con",
+    "para", "por", "que", "del", "al", "se", "mi", "tu", "su", "es", "son",
+    "como", "mas", "más", "pero", "sin", "sobre", "me", "te", "lo", "le",
+}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def current_session_id() -> str:
+    return os.environ.get("OPENCODE_SESSION_ID", "").strip()
+
+
+def ensure_session(st: dict) -> bool:
+    """Si cambió la sesión de OpenCode, reinicia lo efímero y conserva lo global."""
+    sid = current_session_id()
+    if not sid or st.get("session_id") == sid:
+        return False
+    st["session_id"] = sid
+    st["session_core"] = list(st.get("core", DEFAULT_CORE))
+    st["active"] = []
+    st["task"] = ""
+    return True
+
+
+def load_state() -> dict:
+    st = None
+    if STATE.exists():
+        try:
+            st = json.loads(STATE.read_text(encoding="utf-8"))
+        except Exception:
+            st = None
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("task", "")
+    st.setdefault("active", [])
+    st.setdefault("core", list(DEFAULT_CORE))
+    st.setdefault("session_id", "")
+    st.setdefault("session_core", list(st.get("core", DEFAULT_CORE)))
+    st.setdefault("pinned", [])
+    st.setdefault("updated", "")
+    st.pop("max_active", None)
+    if ensure_session(st):
+        save_state(st)
+    return st
+
+
+def save_state(st: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    st["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    STATE.write_text(
+        json.dumps(st, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def download(url: str, dest: Path) -> None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "skillctl/1.0"})
+        with urllib.request.urlopen(req, timeout=90) as r, open(dest, "wb") as out:
+            shutil.copyfileobj(r, out)
+    except Exception:
+        subprocess.run(["curl", "-fsSL", url, "-o", str(dest)], check=True)
+
+
+def yaml_field(fm: str, key: str) -> str:
+    # El catálogo usa listas markdown: "- URL: https://..." o "URL: ...".
+    m = re.search(rf"^(?:-\s*)?{re.escape(key)}:\s*(.*)$", fm, re.M)
+    if not m:
+        return ""
+    val = m.group(1).strip()
+    rest = fm[m.end():].splitlines()
+    if val in {"|", "|-", "|+", ">", ">-", ">+"}:
+        lines = []
+        for line in rest:
+            if line.startswith((" ", "\t")):
+                lines.append(line.strip())
+            elif not line.strip():
+                lines.append("")
+            else:
+                break
+        return " ".join(x for x in lines if x).strip()
+    # Escalar plano que se partió en varias líneas indentadas.
+    if val:
+        extra = []
+        for line in rest[1:] if rest and not rest[0].strip() else rest:
+            if line.startswith(("  ", "\t")):
+                extra.append(line.strip())
+            else:
+                break
+        if extra:
+            val = " ".join([val, *extra])
+    return val.strip("\"'")
+
+
+def refresh() -> None:
+    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CATALOG_DIR / "llms-full.txt.tmp"
+    print("descargando catálogo de opencodeskills.dev...")
+    download(SOURCE, tmp)
+    text = tmp.read_text(encoding="utf-8", errors="replace")
+    blocks = re.split(r"(?m)^### No\. \d+ — ", text)[1:]
+    rows = []
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        name = lines[0].strip()
+        body = "\n".join(lines[1:])
+        url = yaml_field(body, "URL")
+        if not url:
+            continue
+        slug = url.rstrip("/").split("/")[-1]
+        vals = [
+            slug,
+            name,
+            yaml_field(body, "Category"),
+            yaml_field(body, "Tagline"),
+            yaml_field(body, "Description"),
+            yaml_field(body, "Triggers"),
+            yaml_field(body, "Download"),
+        ]
+        rows.append("\t".join(v.replace("\t", " ").replace("\n", " ") for v in vals))
+    INDEX.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    STAMP.write_text(str(int(time.time())), encoding="utf-8")
+    tmp.unlink(missing_ok=True)
+    print(f"{len(rows)} skills indexadas en {INDEX}")
+
+
+def ensure_index() -> None:
+    if not INDEX.exists() or not STAMP.exists():
+        refresh()
+        return
+    try:
+        age = int(time.time()) - int(STAMP.read_text(encoding="utf-8").strip())
+    except Exception:
+        refresh()
+        return
+    if age > MAX_AGE:
+        refresh()
+
+
+def read_index() -> list[list[str]]:
+    ensure_index()
+    rows = []
+    for line in INDEX.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            rows.append(parts)
+    return rows
+
+
+def search(query: str) -> None:
+    words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 1 and w not in STOPWORDS]
+    if not words:
+        die('uso: skillctl search "<texto>"')
+    scored = []
+    for slug, name, cat, tag, desc, trig, _dl in read_index():
+        hay = " ".join([slug, name, cat, tag, desc, trig]).lower()
+        score = 0
+        for w in words:
+            if w in slug.lower():
+                score += 4
+            if w in name.lower():
+                score += 3
+            if w in trig.lower():
+                score += 2
+            if w in hay:
+                score += 1
+        if score:
+            scored.append((score, slug, name, cat, tag))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    print("score\tslug\tnombre\tcategoria\ttagline")
+    for score, slug, name, cat, tag in scored[:8]:
+        print(f"{score}\t{slug}\t{name}\t{cat}\t{tag}")
+    if not scored:
+        print("0\t-\tsin resultados\t-\t-")
+
+
+def find(slug: str) -> list[str] | None:
+    for row in read_index():
+        if row[0] == slug:
+            return row
+    return None
+
+
+def validate_skill_dir(path: Path, slug: str) -> tuple[bool, str]:
+    skill_md = path / "SKILL.md"
+    if not skill_md.exists():
+        return False, "falta SKILL.md"
+    text = skill_md.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\n(.*?)\n---", text, re.S)
+    if not m:
+        return False, "falta frontmatter"
+    fm = m.group(1)
+    name = yaml_field(fm, "name")
+    desc = yaml_field(fm, "description")
+    if not name:
+        return False, "falta name"
+    if not desc:
+        return False, "falta description"
+    if not (1 <= len(desc) <= 1024):
+        return False, f"description fuera de rango ({len(desc)} chars)"
+    if name != slug:
+        print(f"aviso: name={name!r} no coincide con la carpeta {slug!r}", file=sys.stderr)
+    return True, "ok"
+
+
+def scan_unsafe(path: Path) -> list[str]:
+    pattern = re.compile(r"(curl|wget)[^\n|]*\|\s*(sh|bash)|rm\s+-rf\s+/|sudo\s+", re.I)
+    bad = []
+    exts = {".md", ".sh", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml"}
+    for p in path.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            try:
+                if pattern.search(p.read_text(encoding="utf-8", errors="ignore")):
+                    bad.append(str(p.relative_to(path)))
+            except Exception:
+                pass
+    return bad
+
+
+def install(slug: str) -> tuple[bool, str]:
+    if (SKILLS / slug).exists():
+        return True, "ya instalada"
+    if (DISABLED / slug).exists():
+        SKILLS.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(DISABLED / slug), str(SKILLS / slug))
+        return True, "reactivada"
+    row = find(slug)
+    if not row:
+        return False, "no está en el catálogo"
+    url = row[6]
+    if not url or not url.startswith(f"https://{ALLOWED_HOST}/"):
+        return False, "URL de descarga no permitida"
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        zpath = tmpdir / "skill.zip"
+        try:
+            download(url, zpath)
+        except Exception as e:
+            return False, f"error de descarga: {e}"
+        try:
+            with zipfile.ZipFile(zpath) as zf:
+                for info in zf.infolist():
+                    name = info.filename
+                    if name.startswith("/") or ".." in Path(name).parts:
+                        return False, f"zip inseguro: {name}"
+                    mode = info.external_attr >> 16
+                    if mode and (mode & 0o170000) == 0o120000:
+                        return False, f"zip con symlink: {name}"
+                zf.extractall(tmpdir)
+        except Exception as e:
+            return False, f"zip inválido: {e}"
+        candidates = list(tmpdir.rglob("SKILL.md"))
+        if not candidates:
+            return False, "el zip no contiene SKILL.md"
+        src = next((c.parent for c in candidates if c.parent.name == slug), candidates[0].parent)
+        ok, msg = validate_skill_dir(src, slug)
+        if not ok:
+            return False, f"validación: {msg}"
+        bad = scan_unsafe(src)
+        if bad:
+            return False, "posibles comandos peligrosos en " + ", ".join(bad)
+        SKILLS.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(SKILLS / slug))
+    return True, "instalada"
+
+
+def cmd_ensure(slugs: list[str]) -> None:
+    st = load_state()
+    for slug in slugs:
+        ok, msg = install(slug)
+        if not ok:
+            die(f"ERROR {slug}: {msg}")
+        if slug not in st["core"] and slug not in st["active"]:
+            st["active"].append(slug)
+        print(f"{slug}: {msg}; activa")
+    save_state(st)
+
+
+def cmd_sync(dry_run: bool = False) -> None:
+    st = load_state()
+    keep = (
+        set(st.get("core", DEFAULT_CORE))
+        | set(st.get("session_core", []))
+        | set(st.get("active", []))
+        | set(st.get("pinned", []))
+    )
+    DISABLED.mkdir(parents=True, exist_ok=True)
+    moved, skipped = [], []
+    if not SKILLS.exists():
+        print("no hay skills instaladas")
+        return
+    for d in sorted(SKILLS.iterdir()):
+        if not d.is_dir() or d.name in keep:
+            continue
+        if dry_run:
+            moved.append(d.name)
+            continue
+        dest = DISABLED / d.name
+        if dest.exists():
+            skipped.append(d.name)
+            continue
+        shutil.move(str(d), str(dest))
+        moved.append(d.name)
+    if not dry_run:
+        save_state(st)
+    prefix = "(dry-run) " if dry_run else ""
+    print(prefix + "activas: " + (", ".join(sorted(keep)) if keep else "ninguna"))
+    print(f"{prefix}se desactivan: {len(moved)}")
+    if moved:
+        print(prefix + "movidas: " + ", ".join(moved))
+    if skipped:
+        print("aviso, ya existían en disabled: " + ", ".join(skipped))
+    if not dry_run:
+        print("nota: las skills ya cargadas siguen en el contexto hasta compactar.")
+    extras = (set(st.get("session_core", [])) | set(st.get("pinned", []))) - set(
+        st.get("core", DEFAULT_CORE)
+    )
+    if not st.get("active") and not extras:
+        print(
+            "aviso: no hay skills activas ni fijas de sesión; si esto no es intencional, "
+            "usá 'skillctl restore'."
+        )
+
+
+def cmd_begin(task: str) -> None:
+    st = load_state()
+    st["task"] = task
+    st["active"] = []
+    save_state(st)
+    print(f"tarea: {task}")
+    print("activas: 0 (las fijas de sesión siguen vigentes)")
+
+
+def cmd_end() -> None:
+    st = load_state()
+    st["task"] = ""
+    st["active"] = []
+    save_state(st)
+    print("tarea cerrada; activas: 0 (las fijas de sesión siguen vigentes)")
+
+
+def cmd_session_begin(slugs: list[str]) -> None:
+    st = load_state()
+    # load_state ya reinició active/task/session_core si cambió OPENCODE_SESSION_ID.
+    for slug in slugs:
+        ok, msg = install(slug)
+        if not ok:
+            die(f"ERROR {slug}: {msg}")
+        if slug not in st["session_core"]:
+            st["session_core"].append(slug)
+        print(f"{slug}: {msg}; fija en esta sesión")
+    save_state(st)
+    print(f"sesión: {st.get('session_id') or '(sin id)'}")
+    print("fijas: " + (", ".join(st["session_core"]) or "ninguna"))
+
+
+def cmd_session_keep(slugs: list[str]) -> None:
+    st = load_state()
+    for slug in slugs:
+        ok, msg = install(slug)
+        if not ok:
+            die(f"ERROR {slug}: {msg}")
+        if slug not in st["session_core"]:
+            st["session_core"].append(slug)
+        print(f"{slug}: {msg}; fija en esta sesión")
+    save_state(st)
+    print("fijas: " + ", ".join(st["session_core"]))
+
+
+def cmd_session_drop(slugs: list[str]) -> None:
+    st = load_state()
+    core = set(st.get("core", DEFAULT_CORE))
+    blocked = [s for s in slugs if s in core]
+    candidates = [s for s in slugs if s not in core]
+    dropped = [s for s in candidates if s in st["session_core"]]
+    st["session_core"] = [s for s in st["session_core"] if s not in candidates]
+    save_state(st)
+    if blocked:
+        print("no se pueden quitar del core: " + ", ".join(blocked))
+    print("quitadas de fijas: " + (", ".join(dropped) or "ninguna"))
+
+
+def cmd_session_end() -> None:
+    st = load_state()
+    old = [s for s in st.get("session_core", []) if s not in st.get("core", DEFAULT_CORE)]
+    st["session_id"] = ""
+    st["session_core"] = list(st.get("core", DEFAULT_CORE))
+    st["active"] = []
+    st["task"] = ""
+    save_state(st)
+    print(f"sesión cerrada; se liberaron {len(old)} fijas de sesión")
+
+
+def cmd_status() -> None:
+    st = load_state()
+    disk = [d.name for d in SKILLS.iterdir() if d.is_dir()] if SKILLS.exists() else []
+    off = [d.name for d in DISABLED.iterdir() if d.is_dir()] if DISABLED.exists() else []
+    print(f"sesión: {st.get('session_id') or '(sin id)'}")
+    print(f"tarea: {st.get('task') or '(ninguna)'}")
+    print(f"fijas de sesión: {', '.join(st.get('session_core', [])) or '(ninguna)'}")
+    print(f"activas (estado): {', '.join(st.get('active', [])) or '(ninguna)'}")
+    print(f"fijadas globales: {', '.join(st.get('pinned', [])) or '(ninguna)'}")
+    print(f"core: {', '.join(st.get('core', DEFAULT_CORE))}")
+    print(f"skills en disco: {len(disk)}")
+    print(f"desactivadas: {len(off)}")
+    print(f"actualizado: {st.get('updated') or '-'}")
+
+
+def cmd_pin(slug: str) -> None:
+    ok, msg = install(slug)
+    if not ok:
+        die(f"ERROR {slug}: {msg}")
+    st = load_state()
+    if slug not in st["pinned"]:
+        st["pinned"].append(slug)
+    save_state(st)
+    print(f"fijada: {slug} ({msg}); no se desactiva automáticamente")
+
+
+def cmd_unpin(slug: str) -> None:
+    st = load_state()
+    if slug not in st.get("pinned", []):
+        print(f"no estaba fijada: {slug}")
+        return
+    st["pinned"] = [s for s in st["pinned"] if s != slug]
+    save_state(st)
+    print(f"desfijada: {slug}")
+
+
+def cmd_list() -> None:
+    print("== activas")
+    if SKILLS.exists():
+        for d in sorted(SKILLS.iterdir()):
+            if d.is_dir():
+                print(d.name)
+    print("== desactivadas")
+    if DISABLED.exists():
+        for d in sorted(DISABLED.iterdir()):
+            if d.is_dir():
+                print(d.name)
+
+
+def cmd_disable(slug: str) -> None:
+    if slug == "skill-manager":
+        die("no se puede desactivar skill-manager")
+    src, dest = SKILLS / slug, DISABLED / slug
+    if not src.exists():
+        die(f"no existe una skill activa llamada {slug}")
+    DISABLED.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        die(f"{slug} ya existe en skills-disabled")
+    shutil.move(str(src), str(dest))
+    st = load_state()
+    st["active"] = [s for s in st.get("active", []) if s != slug]
+    st["session_core"] = [s for s in st.get("session_core", []) if s != slug]
+    st["pinned"] = [s for s in st.get("pinned", []) if s != slug]
+    save_state(st)
+    print(f"desactivada: {slug}")
+
+
+def cmd_enable(slug: str) -> None:
+    src, dest = DISABLED / slug, SKILLS / slug
+    if dest.exists():
+        print(f"ya está activa: {slug}")
+        return
+    if not src.exists():
+        die(f"no existe una skill desactivada llamada {slug}")
+    SKILLS.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    print(f"activada: {slug}")
+
+
+def cmd_restore() -> None:
+    if not DISABLED.exists():
+        print("no hay skills desactivadas")
+        return
+    moved = []
+    for d in sorted(DISABLED.iterdir()):
+        if not d.is_dir():
+            continue
+        dest = SKILLS / d.name
+        if dest.exists():
+            continue
+        shutil.move(str(d), str(dest))
+        moved.append(d.name)
+    print(f"reactivadas: {len(moved)}")
+    if moved:
+        print(", ".join(moved))
+
+
+def usage() -> None:
+    print(__doc__.strip())
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        usage()
+        return
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+    if cmd == "refresh":
+        refresh()
+    elif cmd == "search":
+        search(" ".join(args))
+    elif cmd == "begin":
+        cmd_begin(" ".join(args))
+    elif cmd == "ensure":
+        if not args:
+            die("uso: skillctl ensure <slug...>")
+        cmd_ensure(args)
+    elif cmd == "session-begin":
+        cmd_session_begin(args)
+    elif cmd == "session-keep":
+        if not args:
+            die("uso: skillctl session-keep <slug...>")
+        cmd_session_keep(args)
+    elif cmd == "session-drop":
+        if not args:
+            die("uso: skillctl session-drop <slug...>")
+        cmd_session_drop(args)
+    elif cmd == "session-end":
+        cmd_session_end()
+    elif cmd == "sync":
+        cmd_sync("--dry-run" in args)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "disable":
+        if not args:
+            die("uso: skillctl disable <slug>")
+        cmd_disable(args[0])
+    elif cmd == "enable":
+        if not args:
+            die("uso: skillctl enable <slug>")
+        cmd_enable(args[0])
+    elif cmd == "pin":
+        if not args:
+            die("uso: skillctl pin <slug>")
+        cmd_pin(args[0])
+    elif cmd == "unpin":
+        if not args:
+            die("uso: skillctl unpin <slug>")
+        cmd_unpin(args[0])
+    elif cmd == "restore":
+        cmd_restore()
+    elif cmd == "end":
+        cmd_end()
+    elif cmd in {"-h", "--help", "help"}:
+        usage()
+    else:
+        die(f"comando desconocido: {cmd}\n\n{__doc__.strip()}")
+
+
+if __name__ == "__main__":
+    main()
