@@ -239,6 +239,8 @@ python3 scripts/build.py
 python3 scripts/build.py --check
 ```
 
+En GitHub, `.github/workflows/ci.yml` ejecuta esas dos verificaciones en cada push a `main` y en cada pull request. Requiere un token con permiso `workflow` solo para subir el archivo por primera vez.
+
 Estructura:
 
 ```text
