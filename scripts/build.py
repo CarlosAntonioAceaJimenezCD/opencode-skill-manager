@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Genera el paquete publicable de skill-manager.
 
-Salida en dist/:
+Salida en docs/:
   index.json                          catálogo HTTP de OpenCode
   skill-manager/                      árbol que descarga OpenCode
   opencode-skill-manager-<ver>.zip    paquete para instalar a mano
 
 Uso:
-  python3 scripts/build.py            regenera dist/
-  python3 scripts/build.py --check    falla si dist/ no coincide con la fuente
+  python3 scripts/build.py            regenera docs/
+  python3 scripts/build.py --check    falla si docs/ no coincide con la fuente
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_ID = "skill-manager"
 SOURCE = ROOT / "skills" / SKILL_ID
-DIST = ROOT / "dist"
+DIST = ROOT / "docs"
 EXCLUDED_DIRS = {"__pycache__", ".git"}
 EXCLUDED_FILES = {".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -160,7 +160,7 @@ def snapshot(root: Path) -> dict[str, bytes]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--check", action="store_true", help="verifica dist/ sin modificarlo"
+        "--check", action="store_true", help="verifica docs/ sin modificarlo"
     )
     args = parser.parse_args()
 
@@ -183,14 +183,14 @@ def main() -> None:
                     if current[key] != expected[key]
                 )
                 for label, items in (
-                    ("sobra en dist/", only_disk),
-                    ("falta en dist/", only_build),
+                    ("sobra en docs/", only_disk),
+                    ("falta en docs/", only_build),
                     ("contenido distinto", changed),
                 ):
                     if items:
                         print(f"{label}: {', '.join(items)}", file=sys.stderr)
-                fail("dist/ está desactualizado; ejecutá python3 scripts/build.py")
-            print(f"dist/ al día: {SKILL_ID} {version}")
+                fail("docs/ está desactualizado; ejecutá python3 scripts/build.py")
+            print(f"docs/ al día: {SKILL_ID} {version}")
             return
 
         if DIST.exists():

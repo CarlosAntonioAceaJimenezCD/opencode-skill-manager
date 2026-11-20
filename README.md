@@ -62,7 +62,7 @@ Sin Pages, también funciona desde el contenido publicado en `main`:
 
 ```jsonc
 {
-  "skills": ["https://raw.githubusercontent.com/<usuario>/opencode-skill-manager/main/dist/"]
+  "skills": ["https://raw.githubusercontent.com/<usuario>/opencode-skill-manager/main/docs/"]
 }
 ```
 
@@ -186,25 +186,25 @@ Estructura:
 .
 ├── SKILL.md                      instrucciones de la skill (en skills/skill-manager/)
 ├── VERSION                       versión del catálogo y del zip
-├── scripts/build.py              genera dist/ y valida el frontmatter
+├── scripts/build.py              genera docs/ y valida el frontmatter
 ├── tests/                        pruebas del CLI y del paquete
 ├── skills/skill-manager/
 │   ├── SKILL.md
 │   ├── references/policy.md
 │   └── scripts/skillctl
-└── dist/                         generado: index.json, skill-manager/ y el zip
+└── docs/                         generado: index.json, skill-manager/ y el zip
 ```
 
-Si cambiás algo dentro de `skills/skill-manager/`, ejecutá `build.py` y confirmá los cambios en `dist/`. CI verifica que estén sincronizados.
+Si cambiás algo dentro de `skills/skill-manager/`, ejecutá `build.py` y confirmá los cambios en `docs/`. `build.py --check` falla si el contenido generado quedó desactualizado; ejecutalo antes de publicar.
 
 ## Publicación
 
-El workflow `.github/workflows/pages.yml` publica `dist/` en GitHub Pages en cada push a `main`. Para activarlo: **Settings → Pages → Build and deployment → Source: GitHub Actions**. Después usá la URL que indique Pages como base del catálogo.
+GitHub Pages publica `docs/` desde la rama `main`: **Settings → Pages → Build and deployment → Source: Deploy from a branch → main / docs**. Cada push que actualice `docs/` actualiza el sitio. La base del catálogo es `https://<usuario>.github.io/opencode-skill-manager/`.
 
-El zip de `dist/` sirve para instalar a mano o para adjuntarlo a un release:
+El zip de `docs/` sirve para instalar a mano o para adjuntarlo a un release:
 
 ```bash
-gh release create v1.0.0 dist/opencode-skill-manager-1.0.0.zip --generate-notes
+gh release create v1.0.0 docs/opencode-skill-manager-1.0.0.zip --generate-notes
 ```
 
 Para proponerla al directorio de terceros `opencodeskills.dev`, escribí al correo de contacto publicado en su página `/about/`, adjuntando el zip, el propósito de la skill y la licencia. Ese directorio no tiene un formulario público de envío; su página `/request/` es para pedir que construyan skills, no para publicar las propias.

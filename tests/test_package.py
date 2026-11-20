@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DIST = ROOT / "dist"
+DIST = ROOT / "docs"
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
