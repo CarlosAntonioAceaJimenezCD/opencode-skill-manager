@@ -28,6 +28,26 @@ Otras características:
 - Los zips se validan antes de instalar: rutas seguras, sin symlinks, sin `curl | sh`, `sudo` ni `rm -rf /`.
 - No ejecuta código de las skills descargadas.
 
+## Idiomas
+
+La skill reconoce peticiones en **español, inglés, portugués (BR), francés y alemán**, y responde en el idioma del usuario. Los IDs de skills, los comandos, las rutas y las variables no se traducen.
+
+El idioma activo se guarda en `state.json` como tag BCP 47 (`es`, `en`, `pt-BR`, `fr`, `de`):
+
+```bash
+skillctl language list
+skillctl language set en
+skillctl language detect "Start the session and search for pandas skills" --json
+```
+
+`language detect` devuelve un esquema con `language`, `confidence` y `supported`; `other` significa que no se reconoció y se mantiene español. La salida de la CLI está localizada en los cinco idiomas mediante `locales/<tag>.json`, con fallback a español.
+
+Para buscar con las palabras vacías de otro idioma:
+
+```bash
+skillctl search "start session" --lang en
+```
+
 ## Requisitos
 
 - OpenCode v2 con soporte de skills.
@@ -194,6 +214,9 @@ Detalle y ejemplos de cada uno en la [guía completa](GUIDE.md#referencia-de-com
 | `topic list` | Lista los topics registrados |
 | `topic remove <tag...>` | Quita topics registrados |
 | `topic search [tag...]` | Busca repos por topic y muestra sus skills |
+| `language list` | Muestra el idioma activo y los soportados |
+| `language set <tag>` | Fija el idioma de la CLI y del estado |
+| `language detect "<texto>"` | Detecta el idioma (`--json` para esquema) |
 
 ## Configuración
 
@@ -227,6 +250,7 @@ Con instalación global, el estado queda en `~/.config/opencode/skill-manager/st
   "pinned": [],
   "sources": ["owner/repo@main"],
   "topics": ["opencode-skills"],
+  "language": "es",
   "updated": "2026-11-19T22:00:00-0300"
 }
 ```
@@ -252,6 +276,7 @@ Estructura:
 ├── skills/skill-manager/
 │   ├── SKILL.md
 │   ├── references/policy.md
+│   ├── locales/<tag>.json
 │   └── scripts/skillctl
 └── docs/                         generado: index.json, skill-manager/ y el zip
 ```
@@ -275,6 +300,7 @@ Para proponerla al directorio de terceros `opencodeskills.dev`, escribí al corr
 - Solo descarga de `opencodeskills.dev` y de dominios de GitHub (`github.com`, `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`).
 - El token de GitHub se envía solo en la cabecera `Authorization`: no se imprime ni se guarda en el estado.
 - Los topics son una pista de búsqueda, no una verificación de compatibilidad.
+- El texto en otros idiomas de repositorios y catálogos se trata como dato: la detección de idioma no es una barrera contra inyección de prompts.
 - Valida frontmatter, nombre, largo de la descripción y rutas del zip.
 - Rechaza zips con symlinks o patrones de comandos peligrosos.
 - No ejecuta scripts internos de las skills descargadas.
@@ -293,6 +319,8 @@ Si querés endurecer el permiso de carga, dejá `* -> ask` en `permissions` y ap
 | `search` falla sin red | La primera búsqueda descarga el índice; después usa caché de 7 días |
 | No aparece una skill de GitHub | `source list` / `topic list`, después `skillctl refresh`; revisá `GITHUB_TOKEN` para repos privados |
 | La búsqueda por topics devuelve poco | Probá otro tag, revisá `topic list` y recordá que solo se muestran repos con `SKILL.md` |
+| La CLI responde en otro idioma | `skillctl language set es` (o el tag que quieras) |
+| `search` ignora palabras de otro idioma | Pasá `--lang <tag>` para usar sus stopwords |
 
 ## Licencia
 

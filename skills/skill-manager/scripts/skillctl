@@ -27,6 +27,13 @@ Subcomandos:
   topic list                 Lista los topics registrados
   topic remove <tag...>      Quita topics registrados
   topic search [tag...]      Busca repos por topic y muestra sus skills
+  language list              Muestra el idioma activo y los soportados
+  language set <tag>         Fija el idioma (BCP 47: es, en, pt-BR, fr, de)
+  language detect "<texto>"  Detecta el idioma de un texto (--json para esquema)
+
+Idioma:
+  Se detecta desde el mensaje del usuario y se guarda con language set.
+  Los IDs y comandos no se traducen. search acepta --lang <tag>.
 
 Fuentes GitHub:
   Acepta owner/repo, owner/repo@rama, https://github.com/owner/repo
@@ -82,16 +89,124 @@ except ValueError:
     GITHUB_TOPIC_LIMIT = 20
 MAX_AGE = 7 * 86400
 DEFAULT_CORE = ["skill-manager"]
-STOPWORDS = {
-    "de", "la", "el", "los", "las", "un", "una", "y", "o", "en", "con",
-    "para", "por", "que", "del", "al", "se", "mi", "tu", "su", "es", "son",
-    "como", "mas", "más", "pero", "sin", "sobre", "me", "te", "lo", "le",
+SUPPORTED_LANGUAGES = ("es", "en", "pt-BR", "fr", "de")
+DEFAULT_LANGUAGE = "es"
+LANGUAGE_ALIASES = {
+    "pt": "pt-BR", "ptbr": "pt-BR", "spanish": "es", "english": "en",
+    "portuguese": "pt-BR", "french": "fr", "german": "de",
+}
+_CANONICAL_LANGUAGES = {lang.lower(): lang for lang in SUPPORTED_LANGUAGES}
+LOCALES_DIR = Path(__file__).resolve().parents[1] / "locales"
+_LANG_CACHE: str | None = None
+_CATALOGS: dict[str, dict[str, str]] = {}
+
+# Palabras vacías por idioma. Se combinan con las del idioma activo en search.
+STOPWORDS_BY_LANG: dict[str, set[str]] = {
+    "es": {
+        "de", "la", "el", "los", "las", "un", "una", "y", "o", "en", "con",
+        "para", "por", "que", "del", "al", "se", "mi", "tu", "su", "es", "son",
+        "como", "mas", "más", "pero", "sin", "sobre", "me", "te", "lo", "le",
+    },
+    "en": {
+        "the", "and", "for", "with", "that", "this", "from", "are", "was",
+        "how", "what", "when", "which", "into", "have", "has", "you", "your",
+    },
+    "pt-BR": {
+        "o", "os", "as", "de", "que", "para", "com", "uma", "por", "como",
+        "do", "da", "dos", "das", "no", "na", "nos", "nas", "um", "e", "ou",
+    },
+    "fr": {
+        "le", "les", "de", "que", "pour", "avec", "une", "par", "comment",
+        "des", "du", "au", "aux", "dans", "est", "sont", "et", "ou", "sur",
+    },
+    "de": {
+        "der", "die", "das", "und", "mit", "für", "eine", "durch", "wie",
+        "den", "dem", "des", "im", "in", "ist", "sind", "oder", "auf", "zu",
+    },
+}
+
+# Marcadores para detect_language: palabras de uso frecuente en peticiones reales.
+LANG_MARKERS: dict[str, set[str]] = {
+    "es": STOPWORDS_BY_LANG["es"] | {
+        "sesion", "sesión", "tarea", "buscar", "instalar", "activar", "fijar",
+        "activa", "activas", "empieza", "termina", "desactiva", "idioma",
+    },
+    "en": STOPWORDS_BY_LANG["en"] | {
+        "session", "task", "search", "install", "activate", "pin", "start",
+        "finish", "disable", "language", "please", "find", "use",
+    },
+    "pt-BR": STOPWORDS_BY_LANG["pt-BR"] | {
+        "sessao", "sessão", "tarefa", "buscar", "instalar", "ativar", "fixar",
+        "ativa", "ativas", "iniciar", "terminar", "desativar", "idioma",
+    },
+    "fr": STOPWORDS_BY_LANG["fr"] | {
+        "session", "tache", "tâche", "rechercher", "installer", "activer",
+        "fixer", "demarrer", "terminer", "desactiver", "langue", "trouver",
+    },
+    "de": STOPWORDS_BY_LANG["de"] | {
+        "sitzung", "aufgabe", "suchen", "installieren", "aktivieren",
+        "fixieren", "starten", "beenden", "deaktivieren", "sprache", "finden",
+    },
 }
 
 
 def die(msg: str, code: int = 1) -> None:
     print(msg, file=sys.stderr)
     sys.exit(code)
+
+
+def normalize_language(value: str) -> str:
+    """Devuelve un tag BCP 47 soportado, o '' si no se reconoce."""
+    text = str(value or "").strip().lower().replace("_", "-")
+    return LANGUAGE_ALIASES.get(text, _CANONICAL_LANGUAGES.get(text, ""))
+
+
+def current_language() -> str:
+    global _LANG_CACHE
+    if _LANG_CACHE is None:
+        try:
+            _LANG_CACHE = normalize_language(load_state().get("language", DEFAULT_LANGUAGE))
+        except Exception:
+            _LANG_CACHE = ""
+        _LANG_CACHE = _LANG_CACHE or DEFAULT_LANGUAGE
+    return _LANG_CACHE
+
+
+def catalog_for(language: str) -> dict[str, str]:
+    if language not in _CATALOGS:
+        data: dict[str, str] = {}
+        path = LOCALES_DIR / f"{language}.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        _CATALOGS[language] = data
+    return _CATALOGS[language]
+
+
+def tr(key: str, **values: object) -> str:
+    language = current_language()
+    text = (
+        catalog_for(language).get(key)
+        or catalog_for(DEFAULT_LANGUAGE).get(key)
+        or key
+    )
+    return text.format(**values) if values else text
+
+
+def detect_language(text: str) -> dict[str, object]:
+    """Detección léxica simple; el modelo puede corregirla con language set."""
+    tokens = re.findall(r"\w+", text.lower())
+    scores = {lang: sum(1 for token in tokens if token in words)
+              for lang, words in LANG_MARKERS.items()}
+    best = max(scores, key=lambda lang: scores[lang])
+    total = sum(scores.values())
+    if not scores[best]:
+        return {"language": "other", "confidence": 0.0,
+                "supported": list(SUPPORTED_LANGUAGES)}
+    return {"language": best, "confidence": round(scores[best] / total, 2),
+            "supported": list(SUPPORTED_LANGUAGES)}
 
 
 def current_session_id() -> str:
@@ -127,6 +242,7 @@ def load_state() -> dict:
     st.setdefault("pinned", [])
     st.setdefault("sources", [])
     st.setdefault("topics", [])
+    st.setdefault("language", DEFAULT_LANGUAGE)
     st.setdefault("updated", "")
     st.pop("max_active", None)
     if ensure_session(st):
@@ -369,7 +485,7 @@ def refresh() -> None:
     tmp = CATALOG_DIR / "llms-full.txt.tmp"
     rows: list[str] = []
     try:
-        print("descargando catálogo de opencodeskills.dev...")
+        print(tr("catalog.downloading"))
         download(SOURCE, tmp)
         text = tmp.read_text(encoding="utf-8", errors="replace")
         blocks = re.split(r"(?m)^### No\. \d+ — ", text)[1:]
@@ -390,7 +506,7 @@ def refresh() -> None:
             ]
             rows.append(row_string(vals))
     except Exception as exc:
-        print(f"aviso: no se pudo indexar opencodeskills.dev: {exc}", file=sys.stderr)
+        print(tr("warn.catalog", error=exc), file=sys.stderr)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -404,15 +520,15 @@ def refresh() -> None:
         try:
             found = github_rows(src)
             rows.extend(row_string(row) for row in found)
-            print(f"{len(found)} skills en GitHub {src['owner']}/{src['repo']}")
+            print(tr("github.indexed", count=len(found), repo=f"{src['owner']}/{src['repo']}"))
         except Exception as exc:
-            print(f"aviso: no se pudo indexar {source_id}: {exc}", file=sys.stderr)
+            print(tr("warn.github_index", source=source_id, error=exc), file=sys.stderr)
 
     for topic in state.get("topics", []):
         try:
             repositories = github_topic_repos(topic)
         except Exception as exc:
-            print(f"aviso: no se pudo buscar el topic {topic}: {exc}", file=sys.stderr)
+            print(tr("warn.topic_search", topic=topic, error=exc), file=sys.stderr)
             continue
         topic_skills = 0
         for src, _meta in repositories:
@@ -427,13 +543,13 @@ def refresh() -> None:
                 row[2] = f"GitHub:{topic}"
                 rows.append(row_string(row))
             topic_skills += len(found)
-        print(f"{topic_skills} skills en repos con topic {topic}")
+        print(tr("topic.indexed", count=topic_skills, topic=topic))
 
     if not rows:
-        die("no se pudo construir ningún índice")
+        die(tr("error.no_index"))
     INDEX.write_text("\n".join(rows) + "\n", encoding="utf-8")
     STAMP.write_text(str(int(time.time())), encoding="utf-8")
-    print(f"{len(rows)} skills indexadas en {INDEX}")
+    print(tr("index.written", count=len(rows), path=INDEX))
 
 
 def ensure_index() -> None:
@@ -461,10 +577,14 @@ def read_index() -> list[list[str]]:
     return rows
 
 
-def search(query: str) -> None:
-    words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 1 and w not in STOPWORDS]
+def search(query: str, language: str | None = None) -> None:
+    lang = normalize_language(language) if language else current_language()
+    if language and not lang:
+        die(tr("language.invalid", value=language))
+    stopwords = STOPWORDS_BY_LANG.get(lang, STOPWORDS_BY_LANG[DEFAULT_LANGUAGE])
+    words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 1 and w not in stopwords]
     if not words:
-        die('uso: skillctl search "<texto>"')
+        die(tr("error.usage", usage='skillctl search "<texto>"'))
     scored = []
     for slug, name, cat, tag, desc, trig, _dl, source in read_index():
         hay = " ".join([slug, name, cat, tag, desc, trig, source]).lower()
@@ -481,11 +601,11 @@ def search(query: str) -> None:
         if score:
             scored.append((score, slug, name, cat, tag, source))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    print("score\tslug\tnombre\tcategoria\ttagline\t" + "fuente")
+    print("\t".join([tr("search.header_score"), "slug", tr("search.header_name"), tr("search.header_category"), tr("search.header_tagline"), tr("search.header_source")]))
     for score, slug, name, cat, tag, source in scored[:8]:
         print(f"{score}\t{slug}\t{name}\t{cat}\t{tag}\t{source or 'opencodeskills'}")
     if not scored:
-        print("0\t-\tsin resultados\t-\t-\t-")
+        print(tr("search.no_results"))
 
 
 def find(slug: str) -> list[str] | None:
@@ -498,23 +618,23 @@ def find(slug: str) -> list[str] | None:
 def validate_skill_dir(path: Path, slug: str) -> tuple[bool, str]:
     skill_md = path / "SKILL.md"
     if not skill_md.exists():
-        return False, "falta SKILL.md"
+        return False, tr("res.missing_skill")
     text = skill_md.read_text(encoding="utf-8", errors="replace")
     m = re.match(r"^---\n(.*?)\n---", text, re.S)
     if not m:
-        return False, "falta frontmatter"
+        return False, tr("res.missing_frontmatter")
     fm = m.group(1)
     name = yaml_field(fm, "name")
     desc = yaml_field(fm, "description")
     if not name:
-        return False, "falta name"
+        return False, tr("res.missing_name")
     if not desc:
-        return False, "falta description"
+        return False, tr("res.missing_description")
     if not (1 <= len(desc) <= 1024):
-        return False, f"description fuera de rango ({len(desc)} chars)"
+        return False, tr("res.description_range", count=len(desc))
     if name != slug:
-        print(f"aviso: name={name!r} no coincide con la carpeta {slug!r}", file=sys.stderr)
-    return True, "ok"
+        print(tr("warn.name_mismatch", name=name, slug=slug), file=sys.stderr)
+    return True, tr("res.ok")
 
 
 def scan_unsafe(path: Path) -> list[str]:
@@ -543,14 +663,14 @@ def extract_zip(zpath: Path, dest: Path, headers: dict[str, str] | None = None) 
             for info in archive.infolist():
                 name = info.filename
                 if name.startswith("/") or not safe_relative(name):
-                    return False, f"zip inseguro: {name}"
+                    return False, tr("res.zip_unsafe", name=name)
                 mode = info.external_attr >> 16
                 if mode and (mode & 0o170000) == 0o120000:
-                    return False, f"zip con symlink: {name}"
+                    return False, tr("res.zip_symlink", name=name)
             archive.extractall(dest)
     except Exception as exc:
-        return False, f"zip inválido: {exc}"
-    return True, "ok"
+        return False, tr("res.zip_invalid", error=exc)
+    return True, tr("res.ok")
 
 
 def skill_candidates(root: Path) -> list[Path]:
@@ -577,25 +697,25 @@ def normalize_candidate(src: Path, root: Path, slug: str) -> Path:
 
 def commit_skill(src: Path, slug: str) -> tuple[bool, str]:
     if (SKILLS / slug).exists():
-        return True, "ya instalada"
+        return True, tr("res.already_installed")
     ok, msg = validate_skill_dir(src, slug)
     if not ok:
         return False, f"validación: {msg}"
     bad = scan_unsafe(src)
     if bad:
-        return False, "posibles comandos peligrosos en " + ", ".join(bad)
+        return False, tr("res.dangerous", list=", ".join(bad))
     SKILLS.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(SKILLS / slug))
-    return True, "instalada"
+    return True, tr("res.installed")
 
 
 def install_raw_catalog(slug: str, spec: str) -> tuple[bool, str]:
     parts = spec.split("|")
     if len(parts) < 3 or not parts[1].startswith(f"{GITHUB_RAW}/"):
-        return False, "catálogo raw no permitido"
+        return False, tr("res.raw_not_allowed")
     base, files = parts[1], parts[2:]
     if "SKILL.md" not in files or any(not safe_relative(f) for f in files):
-        return False, "archivos del catálogo no seguros"
+        return False, tr("res.unsafe_files")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         for rel in files:
@@ -604,33 +724,33 @@ def install_raw_catalog(slug: str, spec: str) -> tuple[bool, str]:
             try:
                 download(base + rel, target, github_headers("text/plain"))
             except Exception as exc:
-                return False, f"error de descarga: {exc}"
+                return False, tr("res.download_error", error=exc)
         candidates = skill_candidates(root)
         src = next((c for c in candidates if c.name == slug), None)
         if src is None:
             src = next((c for c in candidates if c.exists()), None)
         if src is None:
-            return False, "el catálogo no contiene SKILL.md"
+            return False, tr("res.no_catalog_skill")
         return commit_skill(normalize_candidate(src, root, slug), slug)
 
 
 def install_github_zip(slug: str, url: str) -> tuple[bool, str]:
     parsed = urllib.parse.urlparse(url)
     if parsed.hostname not in GITHUB_HOSTS:
-        return False, "URL de GitHub no permitida"
+        return False, tr("res.github_url_not_allowed")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         zpath = root / "repo.zip"
         try:
             download(url, zpath, github_headers())
         except Exception as exc:
-            return False, f"error de descarga: {exc}"
+            return False, tr("res.download_error", error=exc)
         ok, msg = extract_zip(zpath, root)
         if not ok:
             return False, msg
         candidates = skill_candidates(root)
         if not candidates:
-            return False, "el repositorio no contiene SKILL.md"
+            return False, tr("res.no_repo_skill")
         src = next((c for c in candidates if c.name == slug), candidates[0])
         return commit_skill(normalize_candidate(src, root, slug), slug)
 
@@ -638,20 +758,20 @@ def install_github_zip(slug: str, url: str) -> tuple[bool, str]:
 def install_github_repo(value: str) -> list[tuple[str, str]]:
     src = parse_github_source(value)
     if not src:
-        die(f"fuente GitHub no válida: {value}")
+        die(tr("error.github_source_invalid", value=value))
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         zpath = root / "repo.zip"
         try:
             download(github_zipball(src), zpath, github_headers())
         except Exception as exc:
-            die(f"error de descarga de {src['id']}: {exc}")
+            die(tr("error.download_repo", source=src["id"], error=exc))
         ok, msg = extract_zip(zpath, root)
         if not ok:
             die(msg)
         candidates = skill_candidates(root)
         if not candidates:
-            die(f"{src['id']} no contiene SKILL.md")
+            die(tr("error.repo_no_skill", source=src["id"]))
         results = []
         for candidate in candidates:
             slug = candidate.name
@@ -665,14 +785,14 @@ def install_github_repo(value: str) -> list[tuple[str, str]]:
 
 def install(slug: str, row: list[str] | None = None) -> tuple[bool, str]:
     if (SKILLS / slug).exists():
-        return True, "ya instalada"
+        return True, tr("res.already_installed")
     if (DISABLED / slug).exists():
         SKILLS.mkdir(parents=True, exist_ok=True)
         shutil.move(str(DISABLED / slug), str(SKILLS / slug))
-        return True, "reactivada"
+        return True, tr("res.reactivated")
     row = row or find(slug)
     if not row:
-        return False, "no está en el catálogo"
+        return False, tr("res.not_in_catalog")
     url = row[6]
     source = row[7] if len(row) > 7 else ""
     if url.startswith("raw-catalog|"):
@@ -680,20 +800,20 @@ def install(slug: str, row: list[str] | None = None) -> tuple[bool, str]:
     if source.startswith("github:") or url.startswith(f"{GITHUB_API}/"):
         return install_github_zip(slug, url)
     if not url or not url.startswith(f"https://{ALLOWED_HOST}/"):
-        return False, "URL de descarga no permitida"
+        return False, tr("res.download_url_not_allowed")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         zpath = root / "skill.zip"
         try:
             download(url, zpath)
         except Exception as exc:
-            return False, f"error de descarga: {exc}"
+            return False, tr("res.download_error", error=exc)
         ok, msg = extract_zip(zpath, root)
         if not ok:
             return False, msg
         candidates = skill_candidates(root)
         if not candidates:
-            return False, "el zip no contiene SKILL.md"
+            return False, tr("res.zip_no_skill")
         src = next((c for c in candidates if c.name == slug), candidates[0])
         return commit_skill(normalize_candidate(src, root, slug), slug)
 
@@ -706,14 +826,14 @@ def cmd_ensure(slugs: list[str]) -> None:
             for name, msg in install_github_repo(slug):
                 if name not in state["core"] and name not in state["active"]:
                     state["active"].append(name)
-                print(f"{name}: {msg}; activa")
+                print(tr("ensure.active", name=name, msg=msg))
             continue
         ok, msg = install(slug)
         if not ok:
-            die(f"ERROR {slug}: {msg}")
+            die(tr("error.ensure", slug=slug, msg=msg))
         if slug not in state["core"] and slug not in state["active"]:
             state["active"].append(slug)
-        print(f"{slug}: {msg}; activa")
+        print(tr("ensure.active", name=slug, msg=msg))
     save_state(state)
 
 
@@ -728,7 +848,7 @@ def cmd_sync(dry_run: bool = False) -> None:
     DISABLED.mkdir(parents=True, exist_ok=True)
     moved, skipped = [], []
     if not SKILLS.exists():
-        print("no hay skills instaladas")
+        print(tr("sync.no_skills"))
         return
     for d in sorted(SKILLS.iterdir()):
         if not d.is_dir() or d.name in keep:
@@ -745,22 +865,19 @@ def cmd_sync(dry_run: bool = False) -> None:
     if not dry_run:
         save_state(st)
     prefix = "(dry-run) " if dry_run else ""
-    print(prefix + "activas: " + (", ".join(sorted(keep)) if keep else "ninguna"))
-    print(f"{prefix}se desactivan: {len(moved)}")
+    print(prefix + tr("sync.active", list=", ".join(sorted(keep)) if keep else tr("language.other")))
+    print(prefix + tr("sync.deactivate_count", count=len(moved)))
     if moved:
-        print(prefix + "movidas: " + ", ".join(moved))
+        print(prefix + tr("sync.moved", list=", ".join(moved)))
     if skipped:
-        print("aviso, ya existían en disabled: " + ", ".join(skipped))
+        print(tr("sync.already_disabled", list=", ".join(skipped)))
     if not dry_run:
-        print("nota: las skills ya cargadas siguen en el contexto hasta compactar.")
+        print(tr("sync.note"))
     extras = (set(st.get("session_core", [])) | set(st.get("pinned", []))) - set(
         st.get("core", DEFAULT_CORE)
     )
     if not st.get("active") and not extras:
-        print(
-            "aviso: no hay skills activas ni fijas de sesión; si esto no es intencional, "
-            "usá 'skillctl restore'."
-        )
+        print(tr("sync.none_active"))
 
 
 def cmd_begin(task: str) -> None:
@@ -768,8 +885,8 @@ def cmd_begin(task: str) -> None:
     st["task"] = task
     st["active"] = []
     save_state(st)
-    print(f"tarea: {task}")
-    print("activas: 0 (las fijas de sesión siguen vigentes)")
+    print(tr("task.started", task=task))
+    print(tr("task.active_zero"))
 
 
 def cmd_end() -> None:
@@ -777,7 +894,7 @@ def cmd_end() -> None:
     st["task"] = ""
     st["active"] = []
     save_state(st)
-    print("tarea cerrada; activas: 0 (las fijas de sesión siguen vigentes)")
+    print(tr("task.closed"))
 
 
 def cmd_session_begin(slugs: list[str]) -> None:
@@ -786,13 +903,13 @@ def cmd_session_begin(slugs: list[str]) -> None:
     for slug in slugs:
         ok, msg = install(slug)
         if not ok:
-            die(f"ERROR {slug}: {msg}")
+            die(tr("error.ensure", slug=slug, msg=msg))
         if slug not in st["session_core"]:
             st["session_core"].append(slug)
-        print(f"{slug}: {msg}; fija en esta sesión")
+        print(tr("session.fixed", name=slug, msg=msg))
     save_state(st)
-    print(f"sesión: {st.get('session_id') or '(sin id)'}")
-    print("fijas: " + (", ".join(st["session_core"]) or "ninguna"))
+    print(tr("session.header", id=st.get("session_id") or "-"))
+    print(tr("session.fixes", list=", ".join(st["session_core"])))
 
 
 def cmd_session_keep(slugs: list[str]) -> None:
@@ -800,12 +917,12 @@ def cmd_session_keep(slugs: list[str]) -> None:
     for slug in slugs:
         ok, msg = install(slug)
         if not ok:
-            die(f"ERROR {slug}: {msg}")
+            die(tr("error.ensure", slug=slug, msg=msg))
         if slug not in st["session_core"]:
             st["session_core"].append(slug)
-        print(f"{slug}: {msg}; fija en esta sesión")
+        print(tr("session.fixed", name=slug, msg=msg))
     save_state(st)
-    print("fijas: " + ", ".join(st["session_core"]))
+    print(tr("session.fixes", list=", ".join(st["session_core"])))
 
 
 def cmd_session_drop(slugs: list[str]) -> None:
@@ -817,8 +934,8 @@ def cmd_session_drop(slugs: list[str]) -> None:
     st["session_core"] = [s for s in st["session_core"] if s not in candidates]
     save_state(st)
     if blocked:
-        print("no se pueden quitar del core: " + ", ".join(blocked))
-    print("quitadas de fijas: " + (", ".join(dropped) or "ninguna"))
+        print(tr("session.dropped_core", list=", ".join(blocked)))
+    print(tr("session.dropped", list=", ".join(dropped)))
 
 
 def cmd_session_end() -> None:
@@ -829,45 +946,81 @@ def cmd_session_end() -> None:
     st["active"] = []
     st["task"] = ""
     save_state(st)
-    print(f"sesión cerrada; se liberaron {len(old)} fijas de sesión")
+    print(tr("session.closed", count=len(old)))
 
 
 def cmd_status() -> None:
     st = load_state()
     disk = [d.name for d in SKILLS.iterdir() if d.is_dir()] if SKILLS.exists() else []
     off = [d.name for d in DISABLED.iterdir() if d.is_dir()] if DISABLED.exists() else []
-    print(f"sesión: {st.get('session_id') or '(sin id)'}")
-    print(f"tarea: {st.get('task') or '(ninguna)'}")
-    print(f"fijas de sesión: {', '.join(st.get('session_core', [])) or '(ninguna)'}")
-    print(f"activas (estado): {', '.join(st.get('active', [])) or '(ninguna)'}")
-    print(f"fijadas globales: {', '.join(st.get('pinned', [])) or '(ninguna)'}")
-    print(f"fuentes GitHub: {', '.join(st.get('sources', [])) or '(ninguna)'}")
-    print(f"topics GitHub: {', '.join(st.get('topics', [])) or '(ninguno)'}")
-    print(f"core: {', '.join(st.get('core', DEFAULT_CORE))}")
-    print(f"skills en disco: {len(disk)}")
-    print(f"desactivadas: {len(off)}")
-    print(f"actualizado: {st.get('updated') or '-'}")
+    print(tr("session.header", id=st.get("session_id") or "-"))
+    print(tr("status.task", task=st.get("task") or "-"))
+    print(tr("status.session_fixes", list=", ".join(st.get("session_core", []))))
+    print(tr("status.active_state", list=", ".join(st.get("active", []))))
+    print(tr("status.pinned", list=", ".join(st.get("pinned", []))))
+    print(tr("status.sources", list=", ".join(st.get("sources", []))))
+    print(tr("status.topics", list=", ".join(st.get("topics", []))))
+    print(tr("status.language", language=current_language()))
+    print(tr("status.core", list=", ".join(st.get("core", DEFAULT_CORE))))
+    print(tr("status.on_disk", count=len(disk)))
+    print(tr("status.disabled", count=len(off)))
+    print(tr("status.updated", value=st.get("updated") or "-"))
 
 
 def cmd_pin(slug: str) -> None:
     ok, msg = install(slug)
     if not ok:
-        die(f"ERROR {slug}: {msg}")
+        die(tr("error.ensure", slug=slug, msg=msg))
     st = load_state()
     if slug not in st["pinned"]:
         st["pinned"].append(slug)
     save_state(st)
-    print(f"fijada: {slug} ({msg}); no se desactiva automáticamente")
+    print(tr("pin.fixed", slug=slug, msg=msg))
 
 
 def cmd_unpin(slug: str) -> None:
     st = load_state()
     if slug not in st.get("pinned", []):
-        print(f"no estaba fijada: {slug}")
+        print(tr("pin.not_fixed", slug=slug))
         return
     st["pinned"] = [s for s in st["pinned"] if s != slug]
     save_state(st)
-    print(f"desfijada: {slug}")
+    print(tr("pin.unfixed", slug=slug))
+
+
+def cmd_language(action: str, values: list[str]) -> None:
+    global _LANG_CACHE
+    state = load_state()
+    if action in {"set", "detect"} and not values:
+        die(tr("error.usage", usage=f"skillctl language {action} <valor>"))
+
+    if action == "set":
+        language = normalize_language(values[0])
+        if not language:
+            die(tr("language.invalid", value=values[0]))
+        state["language"] = language
+        save_state(state)
+        _LANG_CACHE = language
+        print(tr("language.set", language=language))
+        return
+
+    if action == "detect":
+        use_json = "--json" in values
+        sample = " ".join(v for v in values if v != "--json")
+        result = detect_language(sample)
+        if use_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(tr("language.detected", language=result["language"],
+                     confidence=result["confidence"]))
+        return
+
+    if action in {"list", ""}:
+        print(tr("language.current", language=current_language()))
+        print(tr("language.supported", list=", ".join(SUPPORTED_LANGUAGES)))
+        return
+
+    die(tr("error.usage", usage="skillctl language set|list|detect [texto]"))
 
 
 def cmd_source(action: str, values: list[str]) -> None:
@@ -875,17 +1028,17 @@ def cmd_source(action: str, values: list[str]) -> None:
     sources = list(state.get("sources", []))
     if action == "add":
         if not values:
-            die("uso: skillctl source add <owner/repo...>")
+            die(tr("error.usage", usage="skillctl source add <owner/repo...>"))
         for value in values:
             src = parse_github_source(value)
             if not src:
-                die(f"fuente GitHub no válida: {value}")
+                die(tr("error.github_source_invalid", value=value))
             if src["id"] not in sources:
                 sources.append(src["id"])
-            print(f"fuente agregada: {src['id']}")
+            print(tr("source.added", id=src["id"]))
     elif action == "remove":
         if not values:
-            die("uso: skillctl source remove <owner/repo...>")
+            die(tr("error.usage", usage="skillctl source remove <owner/repo...>"))
         removed = []
         for value in values:
             src = parse_github_source(value)
@@ -893,27 +1046,27 @@ def cmd_source(action: str, values: list[str]) -> None:
             if target in sources:
                 sources.remove(target)
                 removed.append(target)
-        print("fuentes quitadas: " + (", ".join(removed) or "ninguna"))
+        print(tr("source.removed", list=", ".join(removed)))
     elif action in {"list", ""}:
-        print("fuentes GitHub: " + (", ".join(sources) or "(ninguna)"))
+        print(tr("source.list", list=", ".join(sources)))
         return
     else:
-        die("uso: skillctl source add|list|remove [owner/repo...]")
+        die(tr("error.usage", usage="skillctl source add|list|remove [owner/repo...]"))
     state["sources"] = sources
     save_state(state)
-    print(f"fuentes registradas: {len(sources)}")
+    print(tr("source.registered", count=len(sources)))
 
 
 def discover_topics(topics: list[str], register: bool = False) -> None:
     if not topics:
-        die("uso: skillctl topic search <tag...>")
+        die(tr("error.usage", usage="skillctl topic search <tag...>"))
     state = load_state()
     printed = 0
     for topic in topics:
         try:
             repositories = github_topic_repos(topic)
         except Exception as exc:
-            print(f"aviso: no se pudo buscar el topic {topic}: {exc}", file=sys.stderr)
+            print(tr("warn.topic_search", topic=topic, error=exc), file=sys.stderr)
             continue
         for src, meta in repositories:
             try:
@@ -924,16 +1077,16 @@ def discover_topics(topics: list[str], register: bool = False) -> None:
                 continue
             printed += 1
             slugs = ", ".join(row[0] for row in rows[:4])
-            print(f"{src['owner']}/{src['repo']} [{src['branch']}]: {len(rows)} skills → {slugs}")
-            print("  temas: " + (", ".join(meta.get("topics", [])[:8]) or "(ninguno)"))
+            print(tr("topic.found", repo=f"{src['owner']}/{src['repo']}", branch=src["branch"], count=len(rows), slugs=slugs))
+            print(tr("topic.tags", list=", ".join(meta.get("topics", [])[:8])))
             print("  " + str(meta.get("html_url", "")))
             if register and src["id"] not in state["sources"]:
                 state["sources"].append(src["id"])
     if register:
         save_state(state)
-        print(f"fuentes registradas: {len(state['sources'])}")
+        print(tr("source.registered", count=len(state["sources"])))
     if not printed:
-        print("sin repositorios con skills para esos topics")
+        print(tr("topic.no_repos"))
 
 
 def cmd_topic(action: str, values: list[str]) -> None:
@@ -941,39 +1094,39 @@ def cmd_topic(action: str, values: list[str]) -> None:
     topics = list(state.get("topics", []))
     if action == "add":
         if not values:
-            die("uso: skillctl topic add <tag...>")
+            die(tr("error.usage", usage="skillctl topic add <tag...>"))
         for topic in values:
             topic = topic.strip().lstrip("#").lower()
             if not topic:
                 continue
             if topic not in topics:
                 topics.append(topic)
-            print(f"topic registrado: {topic}")
+            print(tr("topic.added", topic=topic))
     elif action == "remove":
         if not values:
-            die("uso: skillctl topic remove <tag...>")
+            die(tr("error.usage", usage="skillctl topic remove <tag...>"))
         targets = {v.strip().lstrip("#").lower() for v in values}
         topics = [t for t in topics if t not in targets]
-        print(f"topics restantes: {len(topics)}")
+        print(tr("topic.remaining", count=len(topics)))
     elif action in {"list", ""}:
-        print("topics GitHub: " + (", ".join(topics) or "(ninguno)"))
+        print(tr("topic.list", list=", ".join(topics)))
         return
     elif action in {"search", "discover"}:
         discover_topics(values or topics)
         return
     else:
-        die("uso: skillctl topic add|list|remove|search [tag...]")
+        die(tr("error.usage", usage="skillctl topic add|list|remove|search [tag...]"))
     state["topics"] = topics
     save_state(state)
 
 
 def cmd_list() -> None:
-    print("== activas")
+    print(tr("list.active"))
     if SKILLS.exists():
         for d in sorted(SKILLS.iterdir()):
             if d.is_dir():
                 print(d.name)
-    print("== desactivadas")
+    print(tr("list.disabled"))
     if DISABLED.exists():
         for d in sorted(DISABLED.iterdir()):
             if d.is_dir():
@@ -982,37 +1135,37 @@ def cmd_list() -> None:
 
 def cmd_disable(slug: str) -> None:
     if slug == "skill-manager":
-        die("no se puede desactivar skill-manager")
+        die(tr("error.cannot_disable_core"))
     src, dest = SKILLS / slug, DISABLED / slug
     if not src.exists():
-        die(f"no existe una skill activa llamada {slug}")
+        die(tr("error.no_active_skill", slug=slug))
     DISABLED.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        die(f"{slug} ya existe en skills-disabled")
+        die(tr("error.already_disabled", slug=slug))
     shutil.move(str(src), str(dest))
     st = load_state()
     st["active"] = [s for s in st.get("active", []) if s != slug]
     st["session_core"] = [s for s in st.get("session_core", []) if s != slug]
     st["pinned"] = [s for s in st.get("pinned", []) if s != slug]
     save_state(st)
-    print(f"desactivada: {slug}")
+    print(tr("skill.disabled", slug=slug))
 
 
 def cmd_enable(slug: str) -> None:
     src, dest = DISABLED / slug, SKILLS / slug
     if dest.exists():
-        print(f"ya está activa: {slug}")
+        print(tr("skill.already_active", slug=slug))
         return
     if not src.exists():
-        die(f"no existe una skill desactivada llamada {slug}")
+        die(tr("error.no_disabled_skill", slug=slug))
     SKILLS.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
-    print(f"activada: {slug}")
+    print(tr("skill.enabled", slug=slug))
 
 
 def cmd_restore() -> None:
     if not DISABLED.exists():
-        print("no hay skills desactivadas")
+        print(tr("restore.none"))
         return
     moved = []
     for d in sorted(DISABLED.iterdir()):
@@ -1023,7 +1176,7 @@ def cmd_restore() -> None:
             continue
         shutil.move(str(d), str(dest))
         moved.append(d.name)
-    print(f"reactivadas: {len(moved)}")
+    print(tr("restore.count", count=len(moved)))
     if moved:
         print(", ".join(moved))
 
@@ -1041,22 +1194,33 @@ def main() -> None:
     if cmd == "refresh":
         refresh()
     elif cmd == "search":
-        search(" ".join(args))
+        query_parts: list[str] = []
+        language: str | None = None
+        rest = list(args)
+        while rest:
+            item = rest.pop(0)
+            if item == "--lang" and rest:
+                language = rest.pop(0)
+            elif item.startswith("--lang="):
+                language = item.split("=", 1)[1]
+            else:
+                query_parts.append(item)
+        search(" ".join(query_parts), language)
     elif cmd == "begin":
         cmd_begin(" ".join(args))
     elif cmd == "ensure":
         if not args:
-            die("uso: skillctl ensure <slug...>")
+            die(tr("error.usage", usage="skillctl ensure <slug...>"))
         cmd_ensure(args)
     elif cmd == "session-begin":
         cmd_session_begin(args)
     elif cmd == "session-keep":
         if not args:
-            die("uso: skillctl session-keep <slug...>")
+            die(tr("error.usage", usage="skillctl session-keep <slug...>"))
         cmd_session_keep(args)
     elif cmd == "session-drop":
         if not args:
-            die("uso: skillctl session-drop <slug...>")
+            die(tr("error.usage", usage="skillctl session-drop <slug...>"))
         cmd_session_drop(args)
     elif cmd == "session-end":
         cmd_session_end()
@@ -1070,21 +1234,23 @@ def main() -> None:
         cmd_source(args[0] if args else "list", args[1:])
     elif cmd == "topic":
         cmd_topic(args[0] if args else "list", args[1:])
+    elif cmd == "language":
+        cmd_language(args[0] if args else "list", args[1:])
     elif cmd == "disable":
         if not args:
-            die("uso: skillctl disable <slug>")
+            die(tr("error.usage", usage="skillctl disable <slug>"))
         cmd_disable(args[0])
     elif cmd == "enable":
         if not args:
-            die("uso: skillctl enable <slug>")
+            die(tr("error.usage", usage="skillctl enable <slug>"))
         cmd_enable(args[0])
     elif cmd == "pin":
         if not args:
-            die("uso: skillctl pin <slug>")
+            die(tr("error.usage", usage="skillctl pin <slug>"))
         cmd_pin(args[0])
     elif cmd == "unpin":
         if not args:
-            die("uso: skillctl unpin <slug>")
+            die(tr("error.usage", usage="skillctl unpin <slug>"))
         cmd_unpin(args[0])
     elif cmd == "restore":
         cmd_restore()
@@ -1093,7 +1259,7 @@ def main() -> None:
     elif cmd in {"-h", "--help", "help"}:
         usage()
     else:
-        die(f"comando desconocido: {cmd}\n\n{__doc__.strip()}")
+        die(tr("error.unknown_command", cmd=cmd) + "\n\n" + __doc__.strip())
 
 
 if __name__ == "__main__":

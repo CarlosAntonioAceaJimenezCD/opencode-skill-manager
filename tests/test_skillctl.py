@@ -24,6 +24,8 @@ class SkillctlTest(unittest.TestCase):
         (self.skill_dir / "SKILL.md").write_text(
             "---\nname: skill-manager\ndescription: test\n---\n", encoding="utf-8"
         )
+        shutil.copytree(ROOT / "skills" / "skill-manager" / "locales",
+                        self.skill_dir / "locales")
         for slug in ("alpha", "beta", "gamma"):
             directory = self.skills / slug
             directory.mkdir()
