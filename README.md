@@ -20,6 +20,8 @@ Cuando hay decenas de skills instaladas, OpenCode anuncia todas en cada paso. El
 Otras características:
 
 - `search` indexa el catálogo de [opencodeskills.dev](https://opencodeskills.dev) y puntúa candidatas por coincidencia.
+- También acepta repositorios de GitHub como fuente: regístralos con `source add` o instalalos directo con `ensure owner/repo`.
+- Puede buscar repos por etiqueta (topics de GitHub) para descubrir skills compatibles con `topic search`.
 - `ensure` instala, reactiva y marca activas **varias** skills de una vez, sin tope.
 - Los zips se validan antes de instalar: rutas seguras, sin symlinks, sin `curl | sh`, `sudo` ni `rm -rf /`.
 - No ejecuta código de las skills descargadas.
@@ -35,7 +37,7 @@ Otras características:
 ### Manual
 
 ```bash
-git clone https://github.com/<usuario>/opencode-skill-manager.git
+git clone https://github.com/CarlosAntonioAceaJimenezCD/opencode-skill-manager.git
 mkdir -p ~/.config/opencode/skills
 cp -R opencode-skill-manager/skills/skill-manager ~/.config/opencode/skills/
 ```
@@ -54,7 +56,7 @@ Con GitHub Pages habilitado, agregá esto a `opencode.json` o `opencode.jsonc`:
 
 ```jsonc
 {
-  "skills": ["https://<usuario>.github.io/opencode-skill-manager/"]
+  "skills": ["https://CarlosAntonioAceaJimenezCD.github.io/opencode-skill-manager/"]
 }
 ```
 
@@ -62,11 +64,54 @@ Sin Pages, también funciona desde el contenido publicado en `main`:
 
 ```jsonc
 {
-  "skills": ["https://raw.githubusercontent.com/<usuario>/opencode-skill-manager/main/docs/"]
+  "skills": ["https://raw.githubusercontent.com/CarlosAntonioAceaJimenezCD/opencode-skill-manager/main/docs/"]
 }
 ```
 
 OpenCode lee `<base>/index.json` y descarga cada archivo desde `<base>/skill-manager/<archivo>`. El `version` del índice cambia con cada `VERSION`; eso renueva la caché.
+
+### Desde GitHub
+
+Además del catálogo público, `skillctl` puede buscar e instalar skills desde repositorios de GitHub:
+
+```bash
+skillctl source add owner/repo
+skillctl refresh
+skillctl search "nombre de la skill"
+skillctl ensure nombre-de-la-skill
+```
+
+`source add` acepta `owner/repo`, `owner/repo@rama`, `https://github.com/owner/repo` y URLs `/tree/<rama>`. `source list` muestra las fuentes registradas y `source remove` las quita.
+
+Si el repo publica un `index.json` de catálogo (en la raíz o en `docs/`), se usa ese índice. Si no, se recorren los `SKILL.md` del árbol con la API de GitHub y se descarga el zipball. Las carpetas `docs/`, `dist/` y las ocultas se ignoran para no instalar copias generadas.
+
+Para instalar un repo sin registrarlo:
+
+```bash
+skillctl ensure owner/repo
+```
+
+Eso instala todas las skills que encuentre en el repo. Para repos privados o para evitar el límite de la API anónima, exportá `GITHUB_TOKEN`.
+
+### Búsqueda por etiqueta
+
+Si no conocés el repo, buscá por topics de GitHub:
+
+```bash
+skillctl topic search opencode-skills python
+```
+
+El comando consulta `topic:<tag>`, descarta repos que no contienen `SKILL.md` y muestra cuántas skills tiene cada uno, sus etiquetas y su URL. Con varios tags hace una búsqueda por cada uno.
+
+Para que esas skills aparezcan también en `search`, registrá las etiquetas:
+
+```bash
+skillctl topic add opencode-skills
+skillctl refresh
+skillctl search "opencode"
+```
+
+Cada etiqueta registrada se indexa con categoría `GitHub:<tag>` (hasta 20 repos por etiqueta). `topic list` y `topic remove` gestionan la lista. Un topic es una pista declarada por el autor, no una garantía de compatibilidad: revisá el `SKILL.md` antes de activar la skill.
 
 ### Permiso
 
@@ -138,6 +183,13 @@ actualizado: 2026-11-19T21:50:50-0400
 | `unpin <slug>` | Quita la fijación global |
 | `restore` | Reactiva todas las desactivadas |
 | `end` | Cierra la tarea actual |
+| `source add <repo...>` | Registra repositorios GitHub como fuente |
+| `source list` | Lista las fuentes GitHub |
+| `source remove <repo...>` | Quita fuentes GitHub |
+| `topic add <tag...>` | Registra topics para buscar skills |
+| `topic list` | Lista los topics registrados |
+| `topic remove <tag...>` | Quita topics registrados |
+| `topic search [tag...]` | Busca repos por topic y muestra sus skills |
 
 ## Configuración
 
@@ -148,6 +200,7 @@ actualizado: 2026-11-19T21:50:50-0400
 | `OPENCODE_SKILL_MANAGER_STATE` | `<raíz>/../skill-manager/state.json` | Archivo de estado |
 | `OPENCODE_SKILL_CATALOG_DIR` | `<raíz>/../skill-catalog` | Caché del catálogo |
 | `OPENCODE_SESSION_ID` | la define OpenCode | Detecta el cambio de sesión |
+| `GITHUB_TOKEN` | — (opcional) | API de GitHub, repos privados y límites más altos |
 
 Ejemplo para gestionar otra raíz:
 
@@ -168,6 +221,8 @@ Con instalación global, el estado queda en `~/.config/opencode/skill-manager/st
   "core": ["skill-manager"],
   "session_core": ["skill-manager", "modern-python", "pytest-patterns"],
   "pinned": [],
+  "sources": ["owner/repo@main"],
+  "topics": ["opencode-skills"],
   "updated": "2026-11-19T22:00:00-0300"
 }
 ```
@@ -199,7 +254,7 @@ Si cambiás algo dentro de `skills/skill-manager/`, ejecutá `build.py` y confir
 
 ## Publicación
 
-GitHub Pages publica `docs/` desde la rama `main`: **Settings → Pages → Build and deployment → Source: Deploy from a branch → main / docs**. Cada push que actualice `docs/` actualiza el sitio. La base del catálogo es `https://<usuario>.github.io/opencode-skill-manager/`.
+GitHub Pages publica `docs/` desde la rama `main`: **Settings → Pages → Build and deployment → Source: Deploy from a branch → main / docs**. Cada push que actualice `docs/` actualiza el sitio. La base del catálogo es `https://CarlosAntonioAceaJimenezCD.github.io/opencode-skill-manager/`.
 
 El zip de `docs/` sirve para instalar a mano o para adjuntarlo a un release:
 
@@ -211,7 +266,9 @@ Para proponerla al directorio de terceros `opencodeskills.dev`, escribí al corr
 
 ## Seguridad
 
-- Solo descarga de `opencodeskills.dev`.
+- Solo descarga de `opencodeskills.dev` y de dominios de GitHub (`github.com`, `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`).
+- El token de GitHub se envía solo en la cabecera `Authorization`: no se imprime ni se guarda en el estado.
+- Los topics son una pista de búsqueda, no una verificación de compatibilidad.
 - Valida frontmatter, nombre, largo de la descripción y rutas del zip.
 - Rechaza zips con symlinks o patrones de comandos peligrosos.
 - No ejecuta scripts internos de las skills descargadas.
@@ -228,6 +285,8 @@ Si querés endurecer el permiso de carga, dejá `* -> ask` en `permissions` y ap
 | El catálogo no se actualiza | Subí `VERSION`, ejecutá `build.py` y publicá de nuevo |
 | Cambiaron las fijas sin intervención | Es el cambio de `OPENCODE_SESSION_ID`: es esperado |
 | `search` falla sin red | La primera búsqueda descarga el índice; después usa caché de 7 días |
+| No aparece una skill de GitHub | `source list` / `topic list`, después `skillctl refresh`; revisá `GITHUB_TOKEN` para repos privados |
+| La búsqueda por topics devuelve poco | Probá otro tag, revisá `topic list` y recordá que solo se muestran repos con `SKILL.md` |
 
 ## Licencia
 

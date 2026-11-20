@@ -20,8 +20,21 @@ Subcomandos:
   unpin <slug>               Quita la fijación global
   restore                    Reactiva todas las desactivadas
   end                        Cierra la tarea actual (conserva las fijas)
+  source add <repo...>       Registra repositorios GitHub como fuente
+  source list                Lista las fuentes GitHub registradas
+  source remove <repo...>    Quita fuentes GitHub
+  topic add <tag...>         Registra topics de GitHub para buscar skills
+  topic list                 Lista los topics registrados
+  topic remove <tag...>      Quita topics registrados
+  topic search [tag...]      Busca repos por topic y muestra sus skills
+
+Fuentes GitHub:
+  Acepta owner/repo, owner/repo@rama, https://github.com/owner/repo
+  y URLs /tree/<rama>. Con index.json publicado usa ese catálogo; si no,
+  descubre los SKILL.md del repositorio. ensure también acepta owner/repo.
 
 Entorno:
+  GITHUB_TOKEN                   Token opcional para GitHub (API y repos privados)
   OPENCODE_SKILLS_DIR            Raíz de skills a gestionar (default: dos niveles arriba del script)
   OPENCODE_SKILLS_DISABLED       Carpeta de desactivadas (default: ../skills-disabled)
   OPENCODE_SKILL_MANAGER_STATE   Archivo de estado (default: ../skill-manager/state.json)
@@ -38,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -59,6 +73,10 @@ STATE = env_path(
 )
 SOURCE = "https://opencodeskills.dev/llms-full.txt"
 ALLOWED_HOST = "opencodeskills.dev"
+GITHUB_API = "https://api.github.com"
+GITHUB_RAW = "https://raw.githubusercontent.com"
+GITHUB_HOSTS = {"github.com", "www.github.com", "api.github.com", "raw.githubusercontent.com", "codeload.github.com"}
+GITHUB_TOPIC_LIMIT = 20
 MAX_AGE = 7 * 86400
 DEFAULT_CORE = ["skill-manager"]
 STOPWORDS = {
@@ -104,6 +122,8 @@ def load_state() -> dict:
     st.setdefault("session_id", "")
     st.setdefault("session_core", list(st.get("core", DEFAULT_CORE)))
     st.setdefault("pinned", [])
+    st.setdefault("sources", [])
+    st.setdefault("topics", [])
     st.setdefault("updated", "")
     st.pop("max_active", None)
     if ensure_session(st):
@@ -119,13 +139,78 @@ def save_state(st: dict) -> None:
     )
 
 
-def download(url: str, dest: Path) -> None:
+def github_headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
+    headers = {
+        "User-Agent": "skillctl/1.0",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def download(url: str, dest: Path, headers: dict[str, str] | None = None) -> None:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "skillctl/1.0"})
+        req = urllib.request.Request(url, headers=headers or {"User-Agent": "skillctl/1.0"})
         with urllib.request.urlopen(req, timeout=90) as r, open(dest, "wb") as out:
             shutil.copyfileobj(r, out)
     except Exception:
+        if headers is not None:
+            raise
         subprocess.run(["curl", "-fsSL", url, "-o", str(dest)], check=True)
+
+
+def http_json(url: str) -> object:
+    req = urllib.request.Request(url, headers=github_headers())
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_github_source(value: str) -> dict[str, str] | None:
+    """Normaliza owner/repo, URL de repo o URL /tree/<rama> a un dict."""
+    text = value.strip().rstrip("/")
+    text = re.sub(r"^git@github\.com:", "", text, flags=re.I)
+    text = re.sub(r"^https?://(?:www\.)?github\.com/", "", text, flags=re.I)
+    if text.lower().startswith("github.com/"):
+        text = text[len("github.com/"):]
+    branch = ""
+    if "@" in text:
+        text, branch = text.rsplit("@", 1)
+    match = re.match(r"^([^/@]+)/([^/@]+?)(?:\.git)?(?:/tree/(.+))?$", text)
+    if not match:
+        return None
+    owner, repo = match.group(1), match.group(2)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", repo):
+        return None
+    branch = (match.group(3) or branch or "main").strip("/")
+    if not branch:
+        branch = "main"
+    return {
+        "owner": owner,
+        "repo": repo,
+        "branch": branch,
+        "id": f"{owner}/{repo}@{branch}",
+    }
+
+
+def github_zipball(src: dict[str, str]) -> str:
+    owner, repo, branch = src["owner"], src["repo"], src["branch"]
+    return f"{GITHUB_API}/repos/{owner}/{repo}/zipball/{urllib.parse.quote(branch, safe='/')}"
+
+
+def github_raw(src: dict[str, str], path: str = "") -> str:
+    owner, repo, branch = src["owner"], src["repo"], src["branch"]
+    base = f"{GITHUB_RAW}/{owner}/{repo}/{urllib.parse.quote(branch, safe='/')}"
+    return f"{base}/{urllib.parse.quote(path, safe='/')}" if path else base + "/"
+
+
+def tagline(text: str, fallback: str) -> str:
+    first = re.split(r"(?<=[.!?])\s+|\n", text.strip(), maxsplit=1)[0]
+    return (first or fallback)[:120]
 
 
 def yaml_field(fm: str, key: str) -> str:
@@ -158,37 +243,193 @@ def yaml_field(fm: str, key: str) -> str:
     return val.strip("\"'")
 
 
+def fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers=github_headers("text/plain"))
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def internal_path(path: str) -> bool:
+    parts = Path(path).parts
+    return any(
+        p in {"docs", "dist", "node_modules", "__pycache__", "skills-disabled", "skill-catalog"}
+        or p.startswith(".")
+        for p in parts
+    )
+
+
+def github_catalog_rows(src: dict[str, str]) -> list[list[str]]:
+    origin = f"github:{src['id']}"
+    rows: list[list[str]] = []
+    for prefix in ("docs/", ""):
+        try:
+            data = http_json(github_raw(src, prefix + "index.json"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("skills"), list):
+            continue
+        for entry in data["skills"]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            files = entry.get("files", [])
+            if not name or not isinstance(files, list) or "SKILL.md" not in files:
+                continue
+            base = github_raw(src, prefix + name + "/")
+            spec = "|".join([base, *(str(f) for f in files)])
+            rows.append([
+                name, name, "GitHub", f"Catálogo en {src['owner']}/{src['repo']}",
+                str(entry.get("description", name)), name, f"raw-catalog|{spec}", origin,
+            ])
+        if rows:
+            return rows
+    return rows
+
+
+def github_tree_rows(src: dict[str, str]) -> list[list[str]]:
+    origin = f"github:{src['id']}"
+    api = (
+        f"{GITHUB_API}/repos/{src['owner']}/{src['repo']}/git/trees/"
+        f"{urllib.parse.quote(src['branch'], safe='/')}?recursive=1"
+    )
+    data = http_json(api)
+    if not isinstance(data, dict):
+        return []
+    tree = data.get("tree", [])
+    paths = [
+        item["path"] for item in tree
+        if isinstance(item, dict) and item.get("type") == "blob"
+        and item.get("path", "").endswith("SKILL.md")
+    ]
+    rows: list[list[str]] = []
+    seen: set[str] = set()
+    for path in paths:
+        if internal_path(path):
+            continue
+        parts = Path(path).parts
+        slug = parts[-2] if len(parts) >= 2 else src["repo"]
+        if slug in seen:
+            continue
+        seen.add(slug)
+        try:
+            frontmatter = re.match(r"^---\n(.*?)\n---", fetch_text(github_raw(src, path)), re.S)
+            fm = frontmatter.group(1) if frontmatter else ""
+        except Exception:
+            fm = ""
+        name = yaml_field(fm, "name") or slug
+        description = yaml_field(fm, "description") or f"Skill en {src['owner']}/{src['repo']}"
+        rows.append([
+            slug, name, "GitHub", tagline(description, name), description,
+            description, github_zipball(src), origin,
+        ])
+    return rows
+
+
+def github_rows(src: dict[str, str]) -> list[list[str]]:
+    rows = github_catalog_rows(src)
+    if rows:
+        return rows
+    return github_tree_rows(src)
+
+
+def github_topic_repos(topic: str) -> list[tuple[dict[str, str], dict]]:
+    """Busca repos por topic y devuelve (fuente, metadatos) con la rama real."""
+    query = urllib.parse.quote(f"topic:{topic.strip()}")
+    url = (
+        f"{GITHUB_API}/search/repositories?q={query}"
+        f"&sort=updated&per_page={GITHUB_TOPIC_LIMIT}"
+    )
+    data = http_json(url)
+    if not isinstance(data, dict):
+        return []
+    results = []
+    for item in data.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        src = parse_github_source(item.get("full_name", ""))
+        if not src:
+            continue
+        branch = item.get("default_branch")
+        if isinstance(branch, str) and branch:
+            src["branch"] = branch
+            src["id"] = f"{src['owner']}/{src['repo']}@{branch}"
+        results.append((src, item))
+    return results
+
+
+def row_string(values: list[str]) -> str:
+    return "\t".join(v.replace("\t", " ").replace("\n", " ") for v in values)
+
+
 def refresh() -> None:
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CATALOG_DIR / "llms-full.txt.tmp"
-    print("descargando catálogo de opencodeskills.dev...")
-    download(SOURCE, tmp)
-    text = tmp.read_text(encoding="utf-8", errors="replace")
-    blocks = re.split(r"(?m)^### No\. \d+ — ", text)[1:]
-    rows = []
-    for block in blocks:
-        lines = block.splitlines()
-        if not lines:
+    rows: list[str] = []
+    try:
+        print("descargando catálogo de opencodeskills.dev...")
+        download(SOURCE, tmp)
+        text = tmp.read_text(encoding="utf-8", errors="replace")
+        blocks = re.split(r"(?m)^### No\. \d+ — ", text)[1:]
+        for block in blocks:
+            lines = block.splitlines()
+            if not lines:
+                continue
+            name = lines[0].strip()
+            body = "\n".join(lines[1:])
+            url = yaml_field(body, "URL")
+            if not url:
+                continue
+            slug = url.rstrip("/").split("/")[-1]
+            vals = [
+                slug, name, yaml_field(body, "Category"), yaml_field(body, "Tagline"),
+                yaml_field(body, "Description"), yaml_field(body, "Triggers"),
+                yaml_field(body, "Download"), "",
+            ]
+            rows.append(row_string(vals))
+    except Exception as exc:
+        print(f"aviso: no se pudo indexar opencodeskills.dev: {exc}", file=sys.stderr)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    state = load_state()
+    seen: set[str] = set()
+    for source_id in state.get("sources", []):
+        src = parse_github_source(source_id)
+        if not src:
             continue
-        name = lines[0].strip()
-        body = "\n".join(lines[1:])
-        url = yaml_field(body, "URL")
-        if not url:
+        seen.add(src["id"])
+        try:
+            found = github_rows(src)
+            rows.extend(row_string(row) for row in found)
+            print(f"{len(found)} skills en GitHub {src['owner']}/{src['repo']}")
+        except Exception as exc:
+            print(f"aviso: no se pudo indexar {source_id}: {exc}", file=sys.stderr)
+
+    for topic in state.get("topics", []):
+        try:
+            repositories = github_topic_repos(topic)
+        except Exception as exc:
+            print(f"aviso: no se pudo buscar el topic {topic}: {exc}", file=sys.stderr)
             continue
-        slug = url.rstrip("/").split("/")[-1]
-        vals = [
-            slug,
-            name,
-            yaml_field(body, "Category"),
-            yaml_field(body, "Tagline"),
-            yaml_field(body, "Description"),
-            yaml_field(body, "Triggers"),
-            yaml_field(body, "Download"),
-        ]
-        rows.append("\t".join(v.replace("\t", " ").replace("\n", " ") for v in vals))
+        topic_skills = 0
+        for src, _meta in repositories:
+            if src["id"] in seen:
+                continue
+            seen.add(src["id"])
+            try:
+                found = github_rows(src)
+            except Exception:
+                continue
+            for row in found:
+                row[2] = f"GitHub:{topic}"
+                rows.append(row_string(row))
+            topic_skills += len(found)
+        print(f"{topic_skills} skills en repos con topic {topic}")
+
+    if not rows:
+        die("no se pudo construir ningún índice")
     INDEX.write_text("\n".join(rows) + "\n", encoding="utf-8")
     STAMP.write_text(str(int(time.time())), encoding="utf-8")
-    tmp.unlink(missing_ok=True)
     print(f"{len(rows)} skills indexadas en {INDEX}")
 
 
@@ -210,8 +451,10 @@ def read_index() -> list[list[str]]:
     rows = []
     for line in INDEX.read_text(encoding="utf-8").splitlines():
         parts = line.split("\t")
-        if len(parts) >= 7:
-            rows.append(parts)
+        if len(parts) < 7:
+            continue
+        parts.extend([""] * (8 - len(parts)))
+        rows.append(parts)
     return rows
 
 
@@ -220,8 +463,8 @@ def search(query: str) -> None:
     if not words:
         die('uso: skillctl search "<texto>"')
     scored = []
-    for slug, name, cat, tag, desc, trig, _dl in read_index():
-        hay = " ".join([slug, name, cat, tag, desc, trig]).lower()
+    for slug, name, cat, tag, desc, trig, _dl, source in read_index():
+        hay = " ".join([slug, name, cat, tag, desc, trig, source]).lower()
         score = 0
         for w in words:
             if w in slug.lower():
@@ -233,13 +476,13 @@ def search(query: str) -> None:
             if w in hay:
                 score += 1
         if score:
-            scored.append((score, slug, name, cat, tag))
+            scored.append((score, slug, name, cat, tag, source))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    print("score\tslug\tnombre\tcategoria\ttagline")
-    for score, slug, name, cat, tag in scored[:8]:
-        print(f"{score}\t{slug}\t{name}\t{cat}\t{tag}")
+    print("score\tslug\tnombre\tcategoria\ttagline\t" + "fuente")
+    for score, slug, name, cat, tag, source in scored[:8]:
+        print(f"{score}\t{slug}\t{name}\t{cat}\t{tag}\t{source or 'opencodeskills'}")
     if not scored:
-        print("0\t-\tsin resultados\t-\t-")
+        print("0\t-\tsin resultados\t-\t-\t-")
 
 
 def find(slug: str) -> list[str] | None:
@@ -274,7 +517,8 @@ def validate_skill_dir(path: Path, slug: str) -> tuple[bool, str]:
 def scan_unsafe(path: Path) -> list[str]:
     pattern = re.compile(r"(curl|wget)[^\n|]*\|\s*(sh|bash)|rm\s+-rf\s+/|sudo\s+", re.I)
     bad = []
-    exts = {".md", ".sh", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml"}
+    # Los .md se excluyen: suelen citar comandos peligrosos como ejemplos de lo que prohíben.
+    exts = {".sh", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml"}
     for p in path.rglob("*"):
         if p.is_file() and p.suffix.lower() in exts:
             try:
@@ -285,63 +529,189 @@ def scan_unsafe(path: Path) -> list[str]:
     return bad
 
 
-def install(slug: str) -> tuple[bool, str]:
+def safe_relative(path: str) -> bool:
+    candidate = Path(path)
+    return not candidate.is_absolute() and ".." not in candidate.parts
+
+
+def extract_zip(zpath: Path, dest: Path, headers: dict[str, str] | None = None) -> tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(zpath) as archive:
+            for info in archive.infolist():
+                name = info.filename
+                if name.startswith("/") or not safe_relative(name):
+                    return False, f"zip inseguro: {name}"
+                mode = info.external_attr >> 16
+                if mode and (mode & 0o170000) == 0o120000:
+                    return False, f"zip con symlink: {name}"
+            archive.extractall(dest)
+    except Exception as exc:
+        return False, f"zip inválido: {exc}"
+    return True, "ok"
+
+
+def skill_candidates(root: Path) -> list[Path]:
+    found = []
+    for skill_md in sorted(root.rglob("SKILL.md")):
+        rel = skill_md.relative_to(root)
+        if internal_path(str(rel)):
+            continue
+        found.append(skill_md.parent)
+    return found
+
+
+def normalize_candidate(src: Path, root: Path, slug: str) -> Path:
+    """Un SKILL.md en la raíz del repo no debe arrastrar el zip descargado."""
+    if src != root:
+        return src
+    target = root / f"__skill_{slug}"
+    target.mkdir()
+    for item in root.iterdir():
+        if item != target and item.suffix != ".zip":
+            shutil.move(str(item), str(target / item.name))
+    return target
+
+
+def commit_skill(src: Path, slug: str) -> tuple[bool, str]:
+    if (SKILLS / slug).exists():
+        return True, "ya instalada"
+    ok, msg = validate_skill_dir(src, slug)
+    if not ok:
+        return False, f"validación: {msg}"
+    bad = scan_unsafe(src)
+    if bad:
+        return False, "posibles comandos peligrosos en " + ", ".join(bad)
+    SKILLS.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(SKILLS / slug))
+    return True, "instalada"
+
+
+def install_raw_catalog(slug: str, spec: str) -> tuple[bool, str]:
+    parts = spec.split("|")
+    if len(parts) < 3 or not parts[1].startswith(f"{GITHUB_RAW}/"):
+        return False, "catálogo raw no permitido"
+    base, files = parts[1], parts[2:]
+    if "SKILL.md" not in files or any(not safe_relative(f) for f in files):
+        return False, "archivos del catálogo no seguros"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for rel in files:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                download(base + rel, target, github_headers("text/plain"))
+            except Exception as exc:
+                return False, f"error de descarga: {exc}"
+        candidates = skill_candidates(root)
+        src = next((c for c in candidates if c.name == slug), None)
+        if src is None:
+            src = next((c for c in candidates if c.exists()), None)
+        if src is None:
+            return False, "el catálogo no contiene SKILL.md"
+        return commit_skill(normalize_candidate(src, root, slug), slug)
+
+
+def install_github_zip(slug: str, url: str) -> tuple[bool, str]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname not in GITHUB_HOSTS:
+        return False, "URL de GitHub no permitida"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        zpath = root / "repo.zip"
+        try:
+            download(url, zpath, github_headers())
+        except Exception as exc:
+            return False, f"error de descarga: {exc}"
+        ok, msg = extract_zip(zpath, root)
+        if not ok:
+            return False, msg
+        candidates = skill_candidates(root)
+        if not candidates:
+            return False, "el repositorio no contiene SKILL.md"
+        src = next((c for c in candidates if c.name == slug), candidates[0])
+        return commit_skill(normalize_candidate(src, root, slug), slug)
+
+
+def install_github_repo(value: str) -> list[tuple[str, str]]:
+    src = parse_github_source(value)
+    if not src:
+        die(f"fuente GitHub no válida: {value}")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        zpath = root / "repo.zip"
+        try:
+            download(github_zipball(src), zpath, github_headers())
+        except Exception as exc:
+            die(f"error de descarga de {src['id']}: {exc}")
+        ok, msg = extract_zip(zpath, root)
+        if not ok:
+            die(msg)
+        candidates = skill_candidates(root)
+        if not candidates:
+            die(f"{src['id']} no contiene SKILL.md")
+        results = []
+        for candidate in candidates:
+            slug = candidate.name
+            if (SKILLS / slug).exists():
+                results.append((slug, "ya instalada"))
+                continue
+            ok, msg = commit_skill(normalize_candidate(candidate, root, slug), slug)
+            results.append((slug, msg))
+        return results
+
+
+def install(slug: str, row: list[str] | None = None) -> tuple[bool, str]:
     if (SKILLS / slug).exists():
         return True, "ya instalada"
     if (DISABLED / slug).exists():
         SKILLS.mkdir(parents=True, exist_ok=True)
         shutil.move(str(DISABLED / slug), str(SKILLS / slug))
         return True, "reactivada"
-    row = find(slug)
+    row = row or find(slug)
     if not row:
         return False, "no está en el catálogo"
     url = row[6]
+    source = row[7] if len(row) > 7 else ""
+    if url.startswith("raw-catalog|"):
+        return install_raw_catalog(slug, url)
+    if source.startswith("github:") or url.startswith(f"{GITHUB_API}/"):
+        return install_github_zip(slug, url)
     if not url or not url.startswith(f"https://{ALLOWED_HOST}/"):
         return False, "URL de descarga no permitida"
     with tempfile.TemporaryDirectory() as td:
-        tmpdir = Path(td)
-        zpath = tmpdir / "skill.zip"
+        root = Path(td)
+        zpath = root / "skill.zip"
         try:
             download(url, zpath)
-        except Exception as e:
-            return False, f"error de descarga: {e}"
-        try:
-            with zipfile.ZipFile(zpath) as zf:
-                for info in zf.infolist():
-                    name = info.filename
-                    if name.startswith("/") or ".." in Path(name).parts:
-                        return False, f"zip inseguro: {name}"
-                    mode = info.external_attr >> 16
-                    if mode and (mode & 0o170000) == 0o120000:
-                        return False, f"zip con symlink: {name}"
-                zf.extractall(tmpdir)
-        except Exception as e:
-            return False, f"zip inválido: {e}"
-        candidates = list(tmpdir.rglob("SKILL.md"))
+        except Exception as exc:
+            return False, f"error de descarga: {exc}"
+        ok, msg = extract_zip(zpath, root)
+        if not ok:
+            return False, msg
+        candidates = skill_candidates(root)
         if not candidates:
             return False, "el zip no contiene SKILL.md"
-        src = next((c.parent for c in candidates if c.parent.name == slug), candidates[0].parent)
-        ok, msg = validate_skill_dir(src, slug)
-        if not ok:
-            return False, f"validación: {msg}"
-        bad = scan_unsafe(src)
-        if bad:
-            return False, "posibles comandos peligrosos en " + ", ".join(bad)
-        SKILLS.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(SKILLS / slug))
-    return True, "instalada"
+        src = next((c for c in candidates if c.name == slug), candidates[0])
+        return commit_skill(normalize_candidate(src, root, slug), slug)
 
 
 def cmd_ensure(slugs: list[str]) -> None:
-    st = load_state()
+    state = load_state()
     for slug in slugs:
+        github_source = parse_github_source(slug) if "/" in slug else None
+        if github_source:
+            for name, msg in install_github_repo(slug):
+                if name not in state["core"] and name not in state["active"]:
+                    state["active"].append(name)
+                print(f"{name}: {msg}; activa")
+            continue
         ok, msg = install(slug)
         if not ok:
             die(f"ERROR {slug}: {msg}")
-        if slug not in st["core"] and slug not in st["active"]:
-            st["active"].append(slug)
+        if slug not in state["core"] and slug not in state["active"]:
+            state["active"].append(slug)
         print(f"{slug}: {msg}; activa")
-    save_state(st)
+    save_state(state)
 
 
 def cmd_sync(dry_run: bool = False) -> None:
@@ -468,6 +838,8 @@ def cmd_status() -> None:
     print(f"fijas de sesión: {', '.join(st.get('session_core', [])) or '(ninguna)'}")
     print(f"activas (estado): {', '.join(st.get('active', [])) or '(ninguna)'}")
     print(f"fijadas globales: {', '.join(st.get('pinned', [])) or '(ninguna)'}")
+    print(f"fuentes GitHub: {', '.join(st.get('sources', [])) or '(ninguna)'}")
+    print(f"topics GitHub: {', '.join(st.get('topics', [])) or '(ninguno)'}")
     print(f"core: {', '.join(st.get('core', DEFAULT_CORE))}")
     print(f"skills en disco: {len(disk)}")
     print(f"desactivadas: {len(off)}")
@@ -493,6 +865,103 @@ def cmd_unpin(slug: str) -> None:
     st["pinned"] = [s for s in st["pinned"] if s != slug]
     save_state(st)
     print(f"desfijada: {slug}")
+
+
+def cmd_source(action: str, values: list[str]) -> None:
+    state = load_state()
+    sources = list(state.get("sources", []))
+    if action == "add":
+        if not values:
+            die("uso: skillctl source add <owner/repo...>")
+        for value in values:
+            src = parse_github_source(value)
+            if not src:
+                die(f"fuente GitHub no válida: {value}")
+            if src["id"] not in sources:
+                sources.append(src["id"])
+            print(f"fuente agregada: {src['id']}")
+    elif action == "remove":
+        if not values:
+            die("uso: skillctl source remove <owner/repo...>")
+        removed = []
+        for value in values:
+            src = parse_github_source(value)
+            target = src["id"] if src else value
+            if target in sources:
+                sources.remove(target)
+                removed.append(target)
+        print("fuentes quitadas: " + (", ".join(removed) or "ninguna"))
+    elif action in {"list", ""}:
+        print("fuentes GitHub: " + (", ".join(sources) or "(ninguna)"))
+        return
+    else:
+        die("uso: skillctl source add|list|remove [owner/repo...]")
+    state["sources"] = sources
+    save_state(state)
+    print(f"fuentes registradas: {len(sources)}")
+
+
+def discover_topics(topics: list[str], register: bool = False) -> None:
+    if not topics:
+        die("uso: skillctl topic search <tag...>")
+    state = load_state()
+    printed = 0
+    for topic in topics:
+        try:
+            repositories = github_topic_repos(topic)
+        except Exception as exc:
+            print(f"aviso: no se pudo buscar el topic {topic}: {exc}", file=sys.stderr)
+            continue
+        for src, meta in repositories:
+            try:
+                rows = github_rows(src)
+            except Exception:
+                continue
+            if not rows:
+                continue
+            printed += 1
+            slugs = ", ".join(row[0] for row in rows[:4])
+            print(f"{src['owner']}/{src['repo']} [{src['branch']}]: {len(rows)} skills → {slugs}")
+            print("  temas: " + (", ".join(meta.get("topics", [])[:8]) or "(ninguno)"))
+            print("  " + str(meta.get("html_url", "")))
+            if register and src["id"] not in state["sources"]:
+                state["sources"].append(src["id"])
+    if register:
+        save_state(state)
+        print(f"fuentes registradas: {len(state['sources'])}")
+    if not printed:
+        print("sin repositorios con skills para esos topics")
+
+
+def cmd_topic(action: str, values: list[str]) -> None:
+    state = load_state()
+    topics = list(state.get("topics", []))
+    if action == "add":
+        if not values:
+            die("uso: skillctl topic add <tag...>")
+        for topic in values:
+            topic = topic.strip().lstrip("#").lower()
+            if not topic:
+                continue
+            if topic not in topics:
+                topics.append(topic)
+            print(f"topic registrado: {topic}")
+    elif action == "remove":
+        if not values:
+            die("uso: skillctl topic remove <tag...>")
+        targets = {v.strip().lstrip("#").lower() for v in values}
+        topics = [t for t in topics if t not in targets]
+        print(f"topics restantes: {len(topics)}")
+    elif action in {"list", ""}:
+        print("topics GitHub: " + (", ".join(topics) or "(ninguno)"))
+        return
+    elif action in {"search", "discover"}:
+        discover_topics(values or topics)
+        return
+    else:
+        die("uso: skillctl topic add|list|remove|search [tag...]")
+    state["topics"] = topics
+    save_state(state)
 
 
 def cmd_list() -> None:
@@ -594,6 +1063,10 @@ def main() -> None:
         cmd_status()
     elif cmd == "list":
         cmd_list()
+    elif cmd == "source":
+        cmd_source(args[0] if args else "list", args[1:])
+    elif cmd == "topic":
+        cmd_topic(args[0] if args else "list", args[1:])
     elif cmd == "disable":
         if not args:
             die("uso: skillctl disable <slug>")

@@ -30,6 +30,40 @@ Hay tres niveles:
 
 **No hay máximo por tarea.** Activá todas las skills que aporten. Lo que evita el ruido es `sync`, no un tope artificial.
 
+## Fuentes de skills
+
+Hay dos fuentes y se pueden usar juntas:
+
+- **opencodeskills.dev**: el catálogo por defecto. `search` y `ensure` funcionan sin configuración.
+- **GitHub**: cualquier repo público (o privado con `GITHUB_TOKEN`). Registralo con `skillctl source add owner/repo` y después `skillctl refresh`.
+
+`source add` acepta `owner/repo`, `owner/repo@rama`, `https://github.com/owner/repo` y URLs `/tree/<rama>`. `source list` y `source remove` gestionan la lista. Las fuentes quedan en `state.json` y sobreviven a cambios de sesión.
+
+Al refrescar, cada fuente GitHub se indexa de dos formas:
+
+1. Si el repo publica un `index.json` de catálogo (en la raíz o en `docs/`), se usa ese índice y sus archivos se descargan con URLs `raw.githubusercontent.com`.
+2. Si no, se recorre el árbol con la API de GitHub, se leen los `SKILL.md` y se descarga el zipball del repo.
+
+`ensure` también acepta un repo directo, sin registrarlo: `skillctl ensure owner/repo` instala todas las skills que encuentre en él. Es útil para un repo propio con varias skills.
+
+La columna `fuente` de `search` distingue `opencodeskills` de `github:<owner>/<repo>@<rama>`.
+
+## Búsqueda por etiqueta (topics)
+
+Para encontrar skills compatibles en GitHub sin conocer el repo:
+
+```bash
+skillctl topic search opencode-skills python
+skillctl topic add opencode-skills
+skillctl refresh
+```
+
+`topic search` consulta la API de búsqueda de repositorios con `topic:<tag>`, descarta los repos que no contienen `SKILL.md` y muestra para cada uno cuántas skills tiene, sus etiquetas y su URL. Con varios tags, los combina como búsquedas separadas (no como un AND).
+
+`topic add` registra etiquetas: cada `refresh` busca repos con esas etiquetas e indexa sus skills como `GitHub:<tag>` en la columna `categoria`. Así `search` puede encontrarlas sin que registres cada repo a mano. `topic list` y `topic remove` gestionan la lista.
+
+Antes de activar una skill descubierta por etiqueta, revisá su `SKILL.md`: GitHub no filtra por calidad ni compatibilidad. Usá la etiqueta como pista, no como garantía.
+
 ## Inicio de sesión
 
 1. `skillctl session-begin` — detecta `OPENCODE_SESSION_ID` y reinicia lo efímero.
@@ -49,8 +83,8 @@ Si dudás entre dos skills, o necesitás los criterios completos, leé `referenc
 1. `skillctl begin "<resumen de la tarea>"` — solo si la tarea es nueva o cambió de tema. Si es un requisito complementario, **no** hagas `begin`: conservá las activas.
 2. `skillctl search "<palabras clave>"` — devuelve hasta 8 candidatas con puntaje.
 3. Elegí **todas** las que aporten. Si no hay match claro, no actives nada y decilo en una línea. Si dos cubren lo mismo, preferí la más específica.
-4. `skillctl ensure <slug...>` — acepta varios slugs. Por cada uno:
-   - lo instala desde el catálogo si falta,
+4. `skillctl ensure <slug...>` — acepta varios slugs o `owner/repo` de GitHub. Por cada uno:
+   - lo instala desde el catálogo (opencodeskills.dev o una fuente GitHub) si falta,
    - lo reactiva si estaba desactivado,
    - lo marca activo en el estado.
 5. Cargá cada elegida con la herramienta `skill`.
@@ -69,16 +103,19 @@ Al cerrar la tarea, informá en pocas líneas:
 
 ## Reglas de seguridad
 
-- Solo se descarga desde `opencodeskills.dev`.
-- El script valida frontmatter, nombre, largo de la descripción y rutas del zip.
-- Si detecta `curl | sh`, `sudo` o `rm -rf /`, se niega a instalar.
+- Solo se descarga desde `opencodeskills.dev` y dominios de GitHub (`github.com`, `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`).
+- El script valida frontmatter, nombre, largo de la descripción, rutas del zip y archivos del catálogo raw.
+- Rechaza zips con symlinks y rutas que salgan del directorio.
+- Si detecta `curl | sh`, `sudo` o `rm -rf /` en scripts o archivos de configuración, se niega a instalar. Los `.md` se excluyen porque suelen citar esos comandos como ejemplos de lo que prohíben.
+- Si usás `GITHUB_TOKEN`, el script lo envía solo en la cabecera `Authorization`; nunca lo imprime ni lo guarda en el estado.
 - La carga de una skill nueva pedirá confirmación por la config `permissions: * -> ask`.
 - Nunca desactives `skill-manager`.
 - No ejecutes scripts internos de una skill descargada; solo cargala con `skill`.
 
 ## Efectos secundarios
 
-- Descarga el catálogo y los zips solo desde `opencodeskills.dev`.
+- Descarga el catálogo y los zips desde `opencodeskills.dev` y desde las fuentes GitHub registradas.
+- Lee el árbol de los repositorios GitHub con la API; con `GITHUB_TOKEN` se aplica el límite de tu cuenta.
 - Mueve carpetas entre `skills/` y `skills-disabled/`.
 - Escribe estado en `skill-manager/state.json` y caché en `skill-catalog/`, junto a la raíz de skills.
 - No ejecuta código de las skills descargadas.
@@ -106,6 +143,13 @@ Al cerrar la tarea, informá en pocas líneas:
 | `skillctl unpin <slug>` | Quita la fijación global |
 | `skillctl restore` | Reactiva todas las desactivadas |
 | `skillctl end` | Cierra la tarea actual |
+| `skillctl source add <repo...>` | Registra repositorios GitHub como fuente |
+| `skillctl source list` | Lista las fuentes GitHub |
+| `skillctl source remove <repo...>` | Quita fuentes GitHub |
+| `skillctl topic add <tag...>` | Registra topics para buscar skills |
+| `skillctl topic list` | Lista los topics registrados |
+| `skillctl topic remove <tag...>` | Quita topics registrados |
+| `skillctl topic search [tag...]` | Busca repos por topic y muestra sus skills |
 
 ## Límites reales
 
@@ -115,6 +159,8 @@ Al cerrar la tarea, informá en pocas líneas:
 - Si `sync` desactivó algo que hacía falta, `enable` o `ensure` lo recuperan sin volver a descargarlo.
 - `pin` es global y permanente; `session-keep` es solo para la sesión actual.
 - Si instalás la skill en una ruta no estándar, definí `OPENCODE_SKILLS_DIR` para que el script sepa qué raíz gestionar.
+- Una fuente GitHub caída no rompe la búsqueda: `refresh` avisa y sigue con las demás. Para repos privados o muchos repos, definí `GITHUB_TOKEN`.
+- La búsqueda de topics consulta hasta 20 repos por etiqueta; con token se aplica el límite de tu cuenta. Sin token, la API de búsqueda es más restrictiva.
 
 ## Referencias
 

@@ -42,6 +42,36 @@ Ejemplos:
    - `fastapi-patterns` > `modern-python` para un endpoint.
 4. Si no hay match claro, no actives nada. Es una respuesta válida.
 
+## Fuentes GitHub
+
+Registrá un repo como fuente cuando el catálogo público no cubra una skill que necesitás, o cuando quieras distribuir las skills de tu equipo:
+
+```bash
+skillctl source add owner/repo
+skillctl refresh
+```
+
+Antes de fijar o activar una skill que viene de GitHub, revisá su `SKILL.md`: no hay revisión editorial detrás de un repo arbitrario. Preferí repos con licencia clara, instrucciones acotadas y sin scripts que se ejecuten solos.
+
+`ensure owner/repo` instala directamente todas las skills del repo sin registrarlo como fuente. Es útil para una prueba puntual; para uso repetido, registralo con `source add` para que aparezca en `search`.
+
+Si el repo publica un `index.json` de catálogo, `refresh` usa esa lista. Si no, descubre los `SKILL.md` del árbol y excluye `docs/`, `dist/` y carpetas ocultas para no instalar copias generadas.
+
+Para repos privados o para no agotar el límite anónimo de la API, exportá `GITHUB_TOKEN`. El token se usa solo en la cabecera de las peticiones.
+
+### Etiquetas como pista de compatibilidad
+
+Los topics de GitHub ayudan a encontrar candidatas cuando no conocés el repo:
+
+```bash
+skillctl topic search opencode-skills
+skillctl topic add opencode-skills
+```
+
+El comando busca `topic:<tag>`, descarta repos sin `SKILL.md` y muestra las etiquetas de cada repo. Un topic indica el tema declarado por el autor, no una verificación de que la skill funcione con tu versión de OpenCode. Contrastalo siempre con el cuerpo de `SKILL.md`, la fecha de actualización y los requisitos que declares.
+
+Los topics registrados se indexan en cada `refresh` con categoría `GitHub:<tag>`. Si una etiqueta devuelve demasiado ruido, eliminala con `topic remove`.
+
 ## Ejemplos
 
 | Tarea | Skills | Por qué |
@@ -99,6 +129,8 @@ Archivo por defecto: `<raíz-de-skills>/../skill-manager/state.json`.
   "core": ["skill-manager"],
   "session_core": ["skill-manager", "modern-python", "pytest-patterns"],
   "pinned": [],
+  "sources": ["owner/repo@main"],
+  "topics": ["opencode-skills"],
   "updated": "2026-11-19T22:00:00-0300"
 }
 ```
