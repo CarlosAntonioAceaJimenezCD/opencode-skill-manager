@@ -2,6 +2,8 @@
 
 Skill de [OpenCode](https://opencode.ai) que gestiona el ciclo de vida de otras skills: fija las transversales de la sesión, activa las que pide cada tarea y desactiva el resto de forma reversible.
 
+📖 **[Guía completa](GUIDE.md)** — referencia de todos los comandos, ejemplos y recetas.
+
 ## El problema
 
 Cuando hay decenas de skills instaladas, OpenCode anuncia todas en cada paso. El modelo recibe descripciones que no corresponden a la tarea, y termina eligiendo mal o cargando de más. `skill-manager` reduce ese ruido sin limitar cuántas skills podés usar: lo que se controla es qué se anuncia, no cuántas se activan.
@@ -162,6 +164,8 @@ actualizado: 2026-11-19T21:50:50-0400
 ```
 
 ## Comandos
+
+Detalle y ejemplos de cada uno en la [guía completa](GUIDE.md#referencia-de-comandos).
 
 | Comando | Efecto |
 |---|---|

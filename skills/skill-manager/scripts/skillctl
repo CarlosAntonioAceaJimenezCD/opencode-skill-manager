@@ -76,7 +76,10 @@ ALLOWED_HOST = "opencodeskills.dev"
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 GITHUB_HOSTS = {"github.com", "www.github.com", "api.github.com", "raw.githubusercontent.com", "codeload.github.com"}
-GITHUB_TOPIC_LIMIT = 20
+try:
+    GITHUB_TOPIC_LIMIT = max(1, min(100, int(os.environ.get("GITHUB_TOPIC_LIMIT", "20"))))
+except ValueError:
+    GITHUB_TOPIC_LIMIT = 20
 MAX_AGE = 7 * 86400
 DEFAULT_CORE = ["skill-manager"]
 STOPWORDS = {
